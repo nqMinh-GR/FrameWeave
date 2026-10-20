@@ -1,0 +1,68 @@
+# FrameWeave Ovis2.5-9B ablations. Paths left empty are resolved from the
+# local machine and recorded; they are not invented.
+seed: 42
+variants:
+  - vanilla
+  - token_mlp
+  - global_only
+  - local_only
+  - hybrid
+  - hybrid_no_time
+
+model_id: ATH-MaaS/Ovis2.5-9B
+model_revision: 5a1f9b995c98ae5b85a28ec89d88d74295be0ea7
+hidden_size: 4096
+rel_dim: 256
+
+herbench_id: DanBenAmi/HERBench
+herbench_config: lite_v2
+herbench_revision: 30b42e97180f2c7c0fdc3f2aed412ae04f0366ca
+herbench_expected_questions: 1971
+herbench_expected_videos: 68
+herbench_base_sha256: 6104884c366906d5c223cc9727c3bad778dcdf98c881c4b17b556c20e940af97
+herbench_acc_sha256: eb67b618f3004b52c8290b2fd30e4012153a66f3f93d576c29760280caa3344d
+
+train_dataset_id: lmms-lab/LLaVA-Video-178K
+train_dataset_revision: 6d8c562dc26d70042a0d9704d1cae58c94b89098
+train_annotation: 0_30_s_perceptiontest/0_30_s_perceptiontest_mc_qa_processed.json
+expected_train_questions: 454
+expected_train_videos: 128
+expected_val_questions: 67
+expected_val_videos: 19
+
+min_pixels: 200704
+max_pixels: 200704
+enable_thinking: false
+use_sdpa: true
+use_gradient_checkpointing: true
+dtype: bfloat16
+adapter_dtype: float32
+
+learning_rate: 0.0002
+weight_decay: 0.01
+warmup_ratio: 0.1
+max_grad_norm: 1.0
+micro_batch_size: 1
+gradient_accumulation_steps: 8
+max_epochs: 8
+early_stop_patience: 3
+k_train: [3, 4, 5, 6, 7, 8]
+herbench_frames: 8
+time_eps: 1.0e-8
+rms_eps: 1.0e-8
+token_mlp_hidden: null
+
+# Canonical validation, materialized from v6 _val_jobs. Not the K=8 original-order fallback.
+val_policy: canonical_v6_val_jobs
+
+paths:
+  train_manifest: ""
+  val_manifest: ""
+  model_dir: ""
+  videos_dir: ""
+  herbench_root: ""
+  herbench_videos: ""
+  herbench_base_vlm: ""
+  herbench_accuracy: ""
+
+output_root: outputs/frameweave_ovis_ablation

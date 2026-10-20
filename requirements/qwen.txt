@@ -1,0 +1,24 @@
+# Pins from the Qwen2.5-VL Colab notebooks. Python 3.11.
+# torch and torchvision come from https://download.pytorch.org/whl/cu121
+# flash-attn is optional; SDPA is enough if that install fails.
+torch==2.4.0
+torchvision==0.19.0
+transformers==4.51.3
+numpy==1.25.0
+pillow==10.3.0
+moviepy==1.0.3
+huggingface_hub
+hf-transfer
+pyarrow==25.0.1
+datasets
+accelerate
+einops
+sentencepiece
+opencv-python-headless
+pandas
+scipy
+tqdm
+ninja
+packaging
+qwen-vl-utils
+flash-attn==2.7.0.post2

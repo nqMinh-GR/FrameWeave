@@ -1,0 +1,23 @@
+# Pins from the Ovis Colab notebooks. Python 3.11.
+# torch and torchvision come from https://download.pytorch.org/whl/cu121
+# flash-attn is required by the Ovis ViT and is installed with --no-build-isolation.
+# Ablation notebooks also install pyarrow==25.0.1.
+torch==2.4.0
+torchvision==0.19.0
+transformers==4.51.3
+numpy==1.25.0
+pillow==10.3.0
+moviepy==1.0.3
+huggingface_hub
+hf-transfer
+datasets
+accelerate
+einops
+sentencepiece
+opencv-python-headless
+pandas
+scipy
+tqdm
+ninja
+packaging
+flash-attn==2.7.0.post2
