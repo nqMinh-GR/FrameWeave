@@ -2,10 +2,15 @@ __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
 outputs/
-checkpoints/
+*.zip
+# Local training weights. Published benchmark files live in /checkpoints.
 *.pt
 *.pth
-*.zip
+checkpoints/
+!/checkpoints/
+!/checkpoints/**
+!/checkpoints/**/*.pt
+!/checkpoints/**/*.pth
 .env
 *.log
 .DS_Store
