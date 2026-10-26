@@ -147,12 +147,30 @@ def extract_question(case: dict, args, runtime: dict | None = None) -> dict:
     timestamps = torch.tensor([stamps], device=model.device, dtype=torch.float32)
     frame_mask = torch.ones(1, len(stamps), device=model.device, dtype=torch.bool)
     example = bool(getattr(args, "example", False))
+    live = bool(getattr(args, "live", False))
     n_choices = len([choice for choice in case["choices"] if str(choice).strip()])
     letter_ids = letter_token_ids(tokenizer, n_choices)
 
     begin_prepare_cache()
     try:
         prepared = preprocess_ovis_inputs(model, frames, prompt, MIN_PIXELS, MAX_PIXELS)
+        if live:
+            vanilla = _scores(
+                generate_ovis(
+                    model, None, "", joining, question_hidden, timestamps, frame_mask,
+                    bypass=False, eval_mode="identity", max_pixels=MAX_PIXELS, min_pixels=MIN_PIXELS,
+                    prepared=prepared, return_scores=True, max_new_tokens=1,
+                ),
+                letter_ids,
+            )
+            full_payload = _forward(
+                model, joining, prepared, question_hidden, timestamps, frame_mask, letter_ids,
+                check_beta=True,
+            )
+            _assert_beta(full_payload["beta"], full_payload["valid"])
+            return _live_result(
+                case, args, frames, indices, frame_meta, localization, vanilla, full_payload
+            )
         if example:
             full_payload = _forward(
                 model, joining, prepared, question_hidden, timestamps, frame_mask, letter_ids,
@@ -494,6 +512,65 @@ def _assert_beta(beta: np.ndarray, valid: np.ndarray) -> None:
             )
         if abs(float(matrix[receiver, receiver])) > 1e-4:
             raise AssertionError("beta diagonal is not closed")
+
+
+def _live_result(case, args, frames, indices, frame_meta, localization, vanilla_scores, payload) -> dict:
+    """Score Vanilla and Hybrid live. Draw only a Vanilla-wrong, Hybrid-correct question."""
+    from reljoin.evidence_flow.mine import _choice_text, live_qualifies
+    from reljoin.herbench_oracle import sha256_file
+
+    gold = str(case.get("gold") or "").strip().upper()[:1]
+    vanilla_letter = str(vanilla_scores.get("letter") or "")
+    hybrid_letter = str(payload["scores"].get("letter") or "")
+    choices = list(case.get("choices") or [])
+    qualified = live_qualifies(vanilla_letter, hybrid_letter, gold)
+    bundle = {
+        "live": True,
+        "qualified": qualified,
+        "example": True,
+        "question_id": case["question_id"],
+        "task_type": case.get("task_type") or "",
+        "question": case.get("question") or "",
+        "choices": choices,
+        "gold": gold,
+        "checkpoint_sha256": sha256_file(Path(args.checkpoint)),
+        "timestamps": [float(value) for value in case["frame_timestamps"]],
+        "vanilla": {
+            "letter": vanilla_letter,
+            "predicted_letter": vanilla_letter,
+            "text": _choice_text(choices, vanilla_letter),
+        },
+        "frameweave": {
+            "letter": hybrid_letter,
+            "predicted_letter": hybrid_letter,
+            "text": _choice_text(choices, hybrid_letter),
+        },
+        "csv_vanilla_letter": case.get("vanilla_letter") or "",
+        "csv_hybrid_letter": case.get("hybrid_letter") or "",
+        "render_allowed": False,
+        "reject_reason": "",
+    }
+    if not qualified:
+        bundle["reject_reason"] = (
+            f"Live Vanilla {vanilla_letter or '?'} / FrameWeave {hybrid_letter or '?'} "
+            f"/ gold {gold or '?'}: figure is kept only when Vanilla is wrong and FrameWeave is correct."
+        )
+        return {"bundle": bundle, "frames": frames, "render": False}
+    beta = payload["beta"][0]
+    selection = select_keyframes(beta)
+    keyframes, edges = _example_view(selection, beta)
+    bundle.update({
+        "localization": localization,
+        "frame_indices": indices,
+        "frame_meta": {key: frame_meta[key] for key in frame_meta if key != "frames"},
+        "selection": {"keyframes": keyframes},
+        "displayed_edges": edges,
+        "render_allowed": bool(keyframes),
+    })
+    if not keyframes:
+        bundle["reject_reason"] = "The live answers qualify, but no frames were selected."
+        return {"bundle": bundle, "frames": frames, "render": False}
+    return {"bundle": bundle, "frames": frames, "render": True}
 
 
 def _example_result(case, args, frames, indices, frame_meta, localization, payload) -> dict:

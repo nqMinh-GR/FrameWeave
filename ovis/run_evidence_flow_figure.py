@@ -31,6 +31,7 @@ def main() -> None:
     _add_runtime(extract)
     extract.add_argument("--q-id", default="")
     extract.add_argument("--flips", action="store_true")
+    extract.add_argument("--live", action="store_true")
     extract.add_argument("--example", action="store_true")
     extract.add_argument("--all-tso", action="store_true")
     extract.add_argument("--draw-all", action="store_true")
@@ -77,6 +78,23 @@ def _add_runtime(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--root", type=Path, default=Path("/tmp/evidence_flow_root"))
 
 
+def _write_lite(workspace: Path, paper: Path) -> dict:
+    from reljoin.evidence_flow.mine import EXPECTED_SHA256, default_paths, load_seed42_lite
+    from reljoin.evidence_flow.signals import write_json
+    from reljoin.herbench_oracle import sha256_file
+
+    report = load_seed42_lite(workspace, paper)
+    checkpoint = default_paths(workspace, paper)["checkpoint"]
+    if checkpoint.is_file():
+        digest = sha256_file(checkpoint)
+        report["checkpoint_sha256_actual"] = digest
+        report["checkpoint_sha256_matches"] = digest == EXPECTED_SHA256
+    path = paper / "audit" / "qual_lite_questions.json"
+    write_json(path, report)
+    print(f"Wrote {path} n_questions={report['n_questions']}", flush=True)
+    return report
+
+
 def _write_rank(workspace: Path, paper: Path) -> dict:
     from reljoin.evidence_flow.mine import EXPECTED_SHA256, default_paths, rank_seed42_flips
     from reljoin.evidence_flow.signals import write_json
@@ -117,14 +135,31 @@ def _extract(args) -> None:
     from reljoin.evidence_flow.mine import default_paths
     from reljoin.evidence_flow.signals import RuntimeBlocked, load_runtime, write_json
 
+    if args.checkpoint is None:
+        args.checkpoint = default_paths(args.workspace, args.paper)["checkpoint"]
+    if getattr(args, "live", False):
+        report = _write_lite(args.workspace, args.paper)
+        cases = list(report.get("all_questions") or [])
+        requested = str(getattr(args, "q_id", "") or "")
+        if requested:
+            cases = [row for row in cases if row["question_id"] == requested]
+        if not cases:
+            raise SystemExit("The seed-42 lite table has no question to score.")
+        try:
+            runtime = load_runtime(args)
+        except RuntimeBlocked as exc:
+            print("Stopped before any question.", flush=True)
+            for blocker in exc.blockers:
+                print(f"- {blocker}", flush=True)
+            raise SystemExit(2) from exc
+        _extract_many(args, report, cases, True, runtime, write_json)
+        return
     report_path = args.paper / "audit" / "qual_candidates_ranked.json"
     report = {}
     if report_path.is_file():
         report = json.loads(report_path.read_text(encoding="utf-8"))
     if not report.get("n_flips") or not report.get("all_questions"):
         report = _write_rank(args.workspace, args.paper)
-    if args.checkpoint is None:
-        args.checkpoint = default_paths(args.workspace, args.paper)["checkpoint"]
     if getattr(args, "flips", False):
         args.example = True
     draw_all = bool(
@@ -170,14 +205,19 @@ def _extract_many(args, report, cases, draw_all, runtime, write_json) -> None:
         question_id = case["question_id"]
         pdf = args.paper / "figures" / "qual_evidence_flow" / f"{question_id}.pdf"
         audit = args.paper / "audit" / f"qual_evidence_flow_{question_id}.json"
-        if _keep_existing(args, pdf, audit):
+        full_png = args.paper / "figures" / "full" / f"{question_id}.png"
+        if _keep_existing(args, pdf, audit, full_png):
             print(f"[{index}/{total}] skip {question_id}", flush=True)
             saved = json.loads(audit.read_text(encoding="utf-8"))
             summary.append({
                 "question_id": question_id,
                 "status": "skipped",
                 "render_allowed": saved.get("render_allowed"),
-                "pdf": True,
+                "qualified": bool(saved.get("qualified")),
+                "pdf": pdf.is_file(),
+                "predicted_vanilla": (saved.get("vanilla") or {}).get("letter"),
+                "predicted_frameweave": (saved.get("frameweave") or {}).get("letter"),
+                "gold": saved.get("gold"),
             })
             continue
         print(f"[{index}/{total}] {question_id}", flush=True)
@@ -189,6 +229,7 @@ def _extract_many(args, report, cases, draw_all, runtime, write_json) -> None:
                 "render_allowed": bundle.get("render_allowed"),
                 "pdf": pdf.is_file(),
                 "reject_reason": bundle.get("reject_reason") or "",
+                "qualified": bool(bundle.get("qualified")),
                 "predicted_vanilla": (bundle.get("vanilla") or {}).get("predicted_letter"),
                 "predicted_frameweave": (bundle.get("frameweave") or {}).get("predicted_letter"),
                 "gold": bundle.get("gold"),
@@ -217,20 +258,34 @@ def _extract_many(args, report, cases, draw_all, runtime, write_json) -> None:
         "blocked": sum(row["status"] == "blocked" for row in summary),
         "error": sum(row["status"] == "error" for row in summary),
         "pdf": sum(bool(row.get("pdf")) for row in summary),
+        "qualified": sum(bool(row.get("qualified")) for row in summary),
     }
-    write_json(path, {"n_questions": total, "counts": counts, "results": summary})
-    print(f"Finished {total} questions. Summary {path} counts={counts}", flush=True)
+    full_dir = args.paper / "figures" / "full"
+    n_full = len(list(full_dir.glob("*.png"))) if full_dir.is_dir() else 0
+    write_json(path, {"n_questions": total, "n_full_images": n_full, "counts": counts, "results": summary})
+    print(
+        f"Finished {total} questions. Full images {n_full} in {full_dir}. Summary {path} counts={counts}",
+        flush=True,
+    )
     if counts["pdf"] == 0 and counts["error"] == total:
         raise SystemExit(1)
 
 
-def _keep_existing(args, pdf: Path, audit: Path) -> bool:
-    """Skip a finished compact figure. An older dense figure is drawn again."""
-    if not (getattr(args, "skip_existing", False) and pdf.is_file() and audit.is_file()):
+def _keep_existing(args, pdf: Path, audit: Path, full_png: Path | None = None) -> bool:
+    """Skip a finished question. A live run only skips its own completed result."""
+    if not (getattr(args, "skip_existing", False) and audit.is_file()):
         return False
     try:
         saved = json.loads(audit.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
+        return False
+    if getattr(args, "live", False):
+        if not saved.get("live"):
+            return False
+        if saved.get("qualified"):
+            return pdf.is_file() and full_png is not None and full_png.is_file()
+        return True
+    if not pdf.is_file():
         return False
     if getattr(args, "example", False) and not saved.get("example"):
         return False
@@ -257,8 +312,22 @@ def _extract_one(args, case, draw_all: bool, runtime) -> dict:
     outputs = render_case(
         result, tex, pdf, allow_candidate=not bool(bundle.get("render_allowed"))
     )
+    full_dir = _copy_full_image(pdf)
     print(f"Wrote {outputs['pdf']}", flush=True)
+    print(f"Full image {full_dir / pdf.name}", flush=True)
     return bundle
+
+
+def _copy_full_image(pdf: Path) -> Path:
+    import shutil
+
+    full_dir = pdf.parents[1] / "full"
+    full_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(pdf, full_dir / pdf.name)
+    preview = pdf.with_suffix(".png")
+    if preview.is_file():
+        shutil.copy2(preview, full_dir / preview.name)
+    return full_dir
 
 
 def _write_blocked(paper, report, case, blockers, write_json, note: str = "") -> None:

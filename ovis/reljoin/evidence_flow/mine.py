@@ -146,6 +146,40 @@ def label_oracle_times(spans: list[tuple[float, float]], duration: float, num_fr
     return times, [labels[time] for time in times], padded, "oracle"
 
 
+def load_seed42_lite(workspace: Path, paper: Path) -> dict:
+    """Every published seed-42 lite question, before any live correctness filter."""
+    paths = default_paths(workspace, paper)
+    by_id = _paired_seed42(paths["csv"], tso_only=False)
+    rows = []
+    for question_id, pair in by_id.items():
+        row = _question_row(question_id, pair)
+        if row is not None:
+            rows.append(row)
+    rows.sort(key=_lite_sort)
+    return {
+        "seed": 42,
+        "herbench_config": "lite_v2",
+        "mode": "live_lite",
+        "n_questions": len(rows),
+        "all_questions": rows,
+        "checkpoint_path": str(paths["checkpoint"]),
+        "checkpoint_sha256_expected": EXPECTED_SHA256,
+        "seed42_predictions": str(paths["csv"]),
+        "notes": [
+            "The live run scores every seed-42 lite question.",
+            "A figure is saved only when that run's Vanilla letter is wrong and its Hybrid letter matches gold.",
+        ],
+    }
+
+
+def live_qualifies(vanilla_letter: str, hybrid_letter: str, gold: str) -> bool:
+    """True when the live Vanilla answer is wrong and the live Hybrid answer is gold."""
+    gold_letter = str(gold or "").strip().upper()[:1]
+    vanilla = str(vanilla_letter or "").strip().upper()[:1]
+    hybrid = str(hybrid_letter or "").strip().upper()[:1]
+    return bool(gold_letter) and vanilla != gold_letter and hybrid == gold_letter
+
+
 def rank_seed42_flips(workspace: Path, paper: Path) -> dict:
     """Seed-42 lite questions where Vanilla is wrong and Hybrid is correct.
 
@@ -186,14 +220,31 @@ def rank_seed42_flips(workspace: Path, paper: Path) -> dict:
     }
 
 
+def _lite_sort(row: dict) -> tuple:
+    return (
+        0 if row["task_type"] == "Temporal Shot Ordering" else 1,
+        row["task_type"],
+        row["question_id"],
+    )
+
+
 def _score_flip(question_id: str, pair: dict) -> dict | None:
     vanilla = pair.get("vanilla") or {}
     hybrid = pair.get("hybrid") or {}
-    if not vanilla or not hybrid:
-        return None
     if str(vanilla.get("is_correct", "")).lower() == "true":
         return None
     if str(hybrid.get("is_correct", "")).lower() != "true":
+        return None
+    row = _question_row(question_id, pair)
+    if row is not None:
+        row["eligible_for_render"] = True
+    return row
+
+
+def _question_row(question_id: str, pair: dict) -> dict | None:
+    vanilla = pair.get("vanilla") or {}
+    hybrid = pair.get("hybrid") or {}
+    if not vanilla or not hybrid:
         return None
     choices = json.loads(vanilla.get("choices_json") or hybrid.get("choices_json") or "[]")
     gold = str(vanilla.get("ground_truth") or hybrid.get("ground_truth") or "").strip().upper()[:1]
@@ -204,7 +255,7 @@ def _score_flip(question_id: str, pair: dict) -> dict | None:
         for value in json.loads(vanilla.get("frame_timestamps") or hybrid.get("frame_timestamps") or "[]")
     ]
     video_path = vanilla.get("video_path") or hybrid.get("video_path") or ""
-    if len(timestamps) < 2 or not video_path:
+    if len(timestamps) < 2 or not video_path or not gold:
         return None
     return {
         "question_id": question_id,
@@ -220,7 +271,7 @@ def _score_flip(question_id: str, pair: dict) -> dict | None:
         "hybrid_text": _choice_text(choices, hybrid_letter),
         "frame_timestamps": timestamps,
         "duration": max(timestamps),
-        "eligible_for_render": True,
+        "eligible_for_render": False,
     }
 
 
