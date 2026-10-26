@@ -30,6 +30,8 @@ def main() -> None:
     extract = sub.add_parser("extract")
     _add_runtime(extract)
     extract.add_argument("--q-id", default="")
+    extract.add_argument("--flips", action="store_true")
+    extract.add_argument("--example", action="store_true")
     extract.add_argument("--all-tso", action="store_true")
     extract.add_argument("--draw-all", action="store_true")
     extract.add_argument("--skip-existing", action="store_true")
@@ -76,11 +78,11 @@ def _add_runtime(parser: argparse.ArgumentParser) -> None:
 
 
 def _write_rank(workspace: Path, paper: Path) -> dict:
-    from reljoin.evidence_flow.mine import EXPECTED_SHA256, default_paths, rank_tso_candidates
+    from reljoin.evidence_flow.mine import EXPECTED_SHA256, default_paths, rank_seed42_flips
     from reljoin.evidence_flow.signals import write_json
     from reljoin.herbench_oracle import sha256_file
 
-    report = rank_tso_candidates(workspace, paper)
+    report = rank_seed42_flips(workspace, paper)
     checkpoint = default_paths(workspace, paper)["checkpoint"]
     if checkpoint.is_file():
         digest = sha256_file(checkpoint)
@@ -89,8 +91,8 @@ def _write_rank(workspace: Path, paper: Path) -> dict:
     path = paper / "audit" / "qual_candidates_ranked.json"
     write_json(path, report)
     print(
-        f"Wrote {path} n_tso={report['n_tso']} concrete={report['n_concrete_wrong']} "
-        f"queue={report['render_queue']}",
+        f"Wrote {path} n_questions={report['n_questions']} n_flips={report['n_flips']} "
+        f"tso_flips={report['n_tso_flips']}",
         flush=True,
     )
     return report
@@ -116,16 +118,24 @@ def _extract(args) -> None:
     from reljoin.evidence_flow.signals import RuntimeBlocked, load_runtime, write_json
 
     report_path = args.paper / "audit" / "qual_candidates_ranked.json"
-    if not report_path.is_file() or not json.loads(report_path.read_text(encoding="utf-8")).get("all_questions"):
-        _write_rank(args.workspace, args.paper)
-    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report = {}
+    if report_path.is_file():
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    if not report.get("n_flips") or not report.get("all_questions"):
+        report = _write_rank(args.workspace, args.paper)
     if args.checkpoint is None:
         args.checkpoint = default_paths(args.workspace, args.paper)["checkpoint"]
-    draw_all = bool(getattr(args, "draw_all", False) or getattr(args, "all_tso", False))
-    if getattr(args, "all_tso", False):
+    if getattr(args, "flips", False):
+        args.example = True
+    draw_all = bool(
+        getattr(args, "draw_all", False)
+        or getattr(args, "all_tso", False)
+        or getattr(args, "flips", False)
+    )
+    if getattr(args, "flips", False) or getattr(args, "all_tso", False):
         cases = list(report.get("all_questions") or [])
         if not cases:
-            raise SystemExit("The rank file has no TSO questions.")
+            raise SystemExit("The rank file has no Vanilla-wrong Hybrid-correct questions.")
         try:
             runtime = load_runtime(args)
         except RuntimeBlocked as exc:
@@ -160,7 +170,7 @@ def _extract_many(args, report, cases, draw_all, runtime, write_json) -> None:
         question_id = case["question_id"]
         pdf = args.paper / "figures" / "qual_evidence_flow" / f"{question_id}.pdf"
         audit = args.paper / "audit" / f"qual_evidence_flow_{question_id}.json"
-        if getattr(args, "skip_existing", False) and pdf.is_file() and audit.is_file():
+        if _keep_existing(args, pdf, audit):
             print(f"[{index}/{total}] skip {question_id}", flush=True)
             saved = json.loads(audit.read_text(encoding="utf-8"))
             summary.append({
@@ -208,10 +218,23 @@ def _extract_many(args, report, cases, draw_all, runtime, write_json) -> None:
         "error": sum(row["status"] == "error" for row in summary),
         "pdf": sum(bool(row.get("pdf")) for row in summary),
     }
-    write_json(path, {"n_tso": total, "counts": counts, "results": summary})
-    print(f"Finished {total} TSO questions. Summary {path} counts={counts}", flush=True)
+    write_json(path, {"n_questions": total, "counts": counts, "results": summary})
+    print(f"Finished {total} questions. Summary {path} counts={counts}", flush=True)
     if counts["pdf"] == 0 and counts["error"] == total:
         raise SystemExit(1)
+
+
+def _keep_existing(args, pdf: Path, audit: Path) -> bool:
+    """Skip a finished compact figure. An older dense figure is drawn again."""
+    if not (getattr(args, "skip_existing", False) and pdf.is_file() and audit.is_file()):
+        return False
+    try:
+        saved = json.loads(audit.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return False
+    if getattr(args, "example", False) and not saved.get("example"):
+        return False
+    return True
 
 
 def _extract_one(args, case, draw_all: bool, runtime) -> dict:

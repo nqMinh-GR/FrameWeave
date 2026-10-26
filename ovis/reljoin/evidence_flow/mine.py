@@ -146,13 +146,91 @@ def label_oracle_times(spans: list[tuple[float, float]], duration: float, num_fr
     return times, [labels[time] for time in times], padded, "oracle"
 
 
-def _paired_seed42(path: Path) -> dict[str, dict]:
+def rank_seed42_flips(workspace: Path, paper: Path) -> dict:
+    """Seed-42 lite questions where Vanilla is wrong and Hybrid is correct.
+
+    Other seeds are not consulted. The published CSV supplies the letters,
+    timestamps, and video path used on the example figure.
+    """
+    paths = default_paths(workspace, paper)
+    by_id = _paired_seed42(paths["csv"], tso_only=False)
+    rows = []
+    for question_id, pair in by_id.items():
+        row = _score_flip(question_id, pair)
+        if row is not None:
+            rows.append(row)
+    rows.sort(key=lambda row: (
+        0 if row["task_type"] == "Temporal Shot Ordering" else 1,
+        row["task_type"],
+        row["question_id"],
+    ))
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["task_type"]] = counts.get(row["task_type"], 0) + 1
+    return {
+        "seed": 42,
+        "herbench_config": "lite_v2",
+        "n_questions": len(by_id),
+        "n_flips": len(rows),
+        "n_tso_flips": counts.get("Temporal Shot Ordering", 0),
+        "counts_by_task": counts,
+        "render_queue": [row["question_id"] for row in rows],
+        "all_questions": rows,
+        "checkpoint_path": str(paths["checkpoint"]),
+        "checkpoint_sha256_expected": EXPECTED_SHA256,
+        "seed42_predictions": str(paths["csv"]),
+        "notes": [
+            "A flip is a published seed-42 lite question where Vanilla is wrong and Hybrid is correct.",
+            "Figure letters are those CSV predictions. Seeds 1, 100, and 2027 are not used.",
+        ],
+    }
+
+
+def _score_flip(question_id: str, pair: dict) -> dict | None:
+    vanilla = pair.get("vanilla") or {}
+    hybrid = pair.get("hybrid") or {}
+    if not vanilla or not hybrid:
+        return None
+    if str(vanilla.get("is_correct", "")).lower() == "true":
+        return None
+    if str(hybrid.get("is_correct", "")).lower() != "true":
+        return None
+    choices = json.loads(vanilla.get("choices_json") or hybrid.get("choices_json") or "[]")
+    gold = str(vanilla.get("ground_truth") or hybrid.get("ground_truth") or "").strip().upper()[:1]
+    vanilla_letter = str(vanilla.get("parsed_prediction") or "").strip().upper()[:1]
+    hybrid_letter = str(hybrid.get("parsed_prediction") or "").strip().upper()[:1]
+    timestamps = [
+        float(value)
+        for value in json.loads(vanilla.get("frame_timestamps") or hybrid.get("frame_timestamps") or "[]")
+    ]
+    video_path = vanilla.get("video_path") or hybrid.get("video_path") or ""
+    if len(timestamps) < 2 or not video_path:
+        return None
+    return {
+        "question_id": question_id,
+        "task_type": vanilla.get("task_type") or "",
+        "video_path": video_path,
+        "question": vanilla.get("question") or "",
+        "choices": choices,
+        "gold": gold,
+        "gold_text": _choice_text(choices, gold),
+        "vanilla_letter": vanilla_letter,
+        "vanilla_text": _choice_text(choices, vanilla_letter),
+        "hybrid_letter": hybrid_letter,
+        "hybrid_text": _choice_text(choices, hybrid_letter),
+        "frame_timestamps": timestamps,
+        "duration": max(timestamps),
+        "eligible_for_render": True,
+    }
+
+
+def _paired_seed42(path: Path, tso_only: bool = True) -> dict[str, dict]:
     if not path.is_file():
         raise FileNotFoundError(f"Seed-42 prediction CSV is missing: {path}")
     paired: dict[str, dict] = {}
     with path.open(newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
-            if not _is_tso(row.get("task_type", ""), row.get("question_id", "")):
+            if tso_only and not _is_tso(row.get("task_type", ""), row.get("question_id", "")):
                 continue
             paired.setdefault(row["question_id"], {})[row["method"]] = row
     return paired

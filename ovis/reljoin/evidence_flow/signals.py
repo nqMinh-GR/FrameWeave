@@ -134,23 +134,32 @@ def extract_question(case: dict, args, runtime: dict | None = None) -> dict:
     localization = runtime["localization"]
 
     video = _resolve_video(case["video_path"], Path(args.videos_root))
+    stamps = [float(value) for value in case["frame_timestamps"]]
     frames, indices, frame_meta = load_oracle_pil_frames(
-        video, [float(t) for t in case["frame_timestamps"]], float(case["duration"] or frame_meta_duration(case))
+        video, stamps, float(case["duration"] or frame_meta_duration(case))
     )
-    if len(frames) != 8:
-        raise RuntimeError(f"Expected 8 frames, loaded {len(frames)}")
+    if len(frames) != len(stamps):
+        raise RuntimeError(f"Expected {len(stamps)} frames, loaded {len(frames)}")
     prompt = format_mc_prompt(case["question"], case["choices"])
     question_hidden = encode_question_hidden(
         model, tokenizer, case["question"], case["choices"], model.device, model.dtype
     )
-    timestamps = torch.tensor([case["frame_timestamps"]], device=model.device, dtype=torch.float32)
-    frame_mask = torch.ones(1, 8, device=model.device, dtype=torch.bool)
+    timestamps = torch.tensor([stamps], device=model.device, dtype=torch.float32)
+    frame_mask = torch.ones(1, len(stamps), device=model.device, dtype=torch.bool)
+    example = bool(getattr(args, "example", False))
     n_choices = len([choice for choice in case["choices"] if str(choice).strip()])
     letter_ids = letter_token_ids(tokenizer, n_choices)
 
     begin_prepare_cache()
     try:
         prepared = preprocess_ovis_inputs(model, frames, prompt, MIN_PIXELS, MAX_PIXELS)
+        if example:
+            full_payload = _forward(
+                model, joining, prepared, question_hidden, timestamps, frame_mask, letter_ids,
+                check_beta=True,
+            )
+            _assert_beta(full_payload["beta"], full_payload["valid"])
+            return _example_result(case, args, frames, indices, frame_meta, localization, full_payload)
         input_ids, _pixels, grid_thws = prepared
         spans = visual_atom_spans(input_ids)
         tokens_per_frame = [end - start for start, end in spans]
@@ -485,6 +494,67 @@ def _assert_beta(beta: np.ndarray, valid: np.ndarray) -> None:
             )
         if abs(float(matrix[receiver, receiver])) > 1e-4:
             raise AssertionError("beta diagonal is not closed")
+
+
+def _example_result(case, args, frames, indices, frame_meta, localization, payload) -> dict:
+    """One Hybrid forward: CSV letters, at most four frames, and two arrows."""
+    from reljoin.herbench_oracle import sha256_file
+
+    beta = payload["beta"][0]
+    selection = select_keyframes(beta)
+    keyframes, edges = _example_view(selection, beta)
+    bundle = {
+        "example": True,
+        "question_id": case["question_id"],
+        "task_type": case.get("task_type") or "",
+        "question": case.get("question") or "",
+        "choices": list(case.get("choices") or []),
+        "gold": case.get("gold"),
+        "checkpoint_sha256": sha256_file(Path(args.checkpoint)),
+        "localization": localization,
+        "frame_indices": indices,
+        "frame_meta": {key: frame_meta[key] for key in frame_meta if key != "frames"},
+        "timestamps": [float(value) for value in case["frame_timestamps"]],
+        "selection": {"keyframes": keyframes},
+        "displayed_edges": edges,
+        "vanilla": {
+            "letter": case.get("vanilla_letter") or "",
+            "text": case.get("vanilla_text") or "",
+        },
+        "frameweave": {
+            "letter": case.get("hybrid_letter") or "",
+            "text": case.get("hybrid_text") or "",
+        },
+        "render_allowed": True,
+        "reject_reason": "" if edges else "No off-diagonal relation was strong enough to draw an arrow.",
+    }
+    return {"bundle": bundle, "frames": frames, "render": True}
+
+
+def _example_view(selection: dict, beta: np.ndarray, *, max_frames: int = 4, max_edges: int = 2):
+    if not selection.get("edges"):
+        selection = _fallback_edges(selection, beta)
+    edges = sorted(selection.get("edges") or [], key=lambda edge: (-float(edge["beta"]), edge["receiver"], edge["source"]))
+    edges = edges[:max_edges]
+    touched = []
+    for edge in edges:
+        for frame in (int(edge["source"]), int(edge["receiver"])):
+            if frame not in touched:
+                touched.append(frame)
+    if len(touched) < 2:
+        for frame in selection.get("keyframes") or []:
+            if int(frame) not in touched:
+                touched.append(int(frame))
+            if len(touched) >= 2:
+                break
+    keyframes = sorted(touched)[:max_frames]
+    visible = set(keyframes)
+    edges = [
+        {"receiver": int(edge["receiver"]), "source": int(edge["source"])}
+        for edge in edges
+        if int(edge["receiver"]) in visible and int(edge["source"]) in visible
+    ]
+    return keyframes, edges
 
 
 def _fallback_edges(selection: dict, beta: np.ndarray) -> dict:
