@@ -57,6 +57,7 @@ def rank_tso_candidates(workspace: Path, paper: Path) -> dict:
     for rank, row in enumerate(abstention, start=1):
         row["rank"] = rank
     eligible = [row["question_id"] for row in concrete if row["eligible_for_render"]]
+    all_questions = sorted(rows, key=_batch_key)
     return {
         "task": "Temporal Shot Ordering",
         "herbench_config": "lite_v2",
@@ -70,6 +71,7 @@ def rank_tso_candidates(workspace: Path, paper: Path) -> dict:
         "n_concrete_wrong": len(concrete),
         "n_abstention_flips": len(abstention),
         "render_queue": eligible,
+        "all_questions": all_questions,
         "notes": [
             "Concrete-wrong means Vanilla selected an ordering letter, not the abstention sentence, and Hybrid selected gold.",
             "Abstention flips are audited and are not rendered unless --allow-abstention is set.",
@@ -271,6 +273,15 @@ def _sort_key(row: dict):
     return (
         -int(row["n_seeds_correct"]),
         -int(row["n_distinct_evidence_spans_in_k8"]),
+        row["question_id"],
+    )
+
+
+def _batch_key(row: dict):
+    tier_rank = {"concrete_wrong": 0, "abstention_flip": 1}.get(row["tier"], 2)
+    return (
+        0 if row["eligible_for_render"] else 1,
+        tier_rank,
         row["question_id"],
     )
 

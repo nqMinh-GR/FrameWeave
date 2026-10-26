@@ -55,43 +55,29 @@ def runtime_blockers(model_dir: str, videos_root: str, video_path: str, checkpoi
             "Ovis2.5-9B weights were not found. Pass --model-dir with a local config.json. "
             "No spatial figure was drawn."
         )
-    resolved = _resolve_video(video_path, Path(videos_root) if videos_root else None)
-    if resolved is None:
-        blockers.append(
-            f"HERBench video for this question was not found ({video_path}). "
-            "Pass --videos-root. No frame image was invented."
-        )
+    if video_path:
+        resolved = _resolve_video(video_path, Path(videos_root) if videos_root else None)
+        if resolved is None:
+            blockers.append(
+                f"HERBench video for this question was not found ({video_path}). "
+                "Pass --videos-root. No frame image was invented."
+            )
     return blockers
 
 
-def extract_question(case: dict, args) -> dict:
-    """Run localization, then one question. Raises if the runtime or the alignment test fails."""
-    from reljoin.herbench_oracle import load_oracle_pil_frames, sha256_file
-
+def load_runtime(args) -> dict:
+    """Load Ovis and the Hybrid checkpoint once. Localization runs once for that process."""
     blockers = runtime_blockers(
         getattr(args, "model_dir", ""),
         getattr(args, "videos_root", ""),
-        case.get("video_path", ""),
+        "",
         Path(args.checkpoint),
     )
     if blockers:
         raise RuntimeBlocked(blockers)
 
-    import torch
-
     from reljoin.config import ExperimentConfig
-    from reljoin.losses import letter_token_ids
-    from reljoin.ovis_generate import format_mc_prompt, generate_ovis, preprocess_ovis_inputs
-    from reljoin.ovis_hooks import (
-        begin_prepare_cache,
-        encode_question_hidden,
-        end_prepare_cache,
-        freeze_backbone,
-        get_hook_state,
-        install_reljoin_hook,
-        ovis_hidden_size,
-        visual_atom_spans,
-    )
+    from reljoin.ovis_hooks import freeze_backbone, install_reljoin_hook, ovis_hidden_size
     from reljoin.train import load_ovis
     from run_herbench_oracle_reljoin import load_reljoin_module
 
@@ -106,6 +92,46 @@ def extract_question(case: dict, args) -> dict:
         Path(args.checkpoint), ovis_hidden_size(model), model.device, variant="Hybrid"
     )
     joining.eval()
+    return {
+        "model": model,
+        "tokenizer": tokenizer,
+        "joining": joining,
+        "localization": localization,
+    }
+
+
+def extract_question(case: dict, args, runtime: dict | None = None) -> dict:
+    """Run one question. Raises if that question's video or the alignment test fails."""
+    from reljoin.herbench_oracle import load_oracle_pil_frames, sha256_file
+
+    if runtime is None:
+        runtime = load_runtime(args)
+    video_blockers = runtime_blockers(
+        getattr(args, "model_dir", ""),
+        getattr(args, "videos_root", ""),
+        case.get("video_path", ""),
+        Path(args.checkpoint),
+    )
+    video_blockers = [item for item in video_blockers if item.startswith("HERBench video")]
+    if video_blockers:
+        raise RuntimeBlocked(video_blockers)
+
+    import torch
+
+    from reljoin.losses import letter_token_ids
+    from reljoin.ovis_generate import format_mc_prompt, generate_ovis, preprocess_ovis_inputs
+    from reljoin.ovis_hooks import (
+        begin_prepare_cache,
+        encode_question_hidden,
+        end_prepare_cache,
+        get_hook_state,
+        visual_atom_spans,
+    )
+
+    model = runtime["model"]
+    tokenizer = runtime["tokenizer"]
+    joining = runtime["joining"]
+    localization = runtime["localization"]
 
     video = _resolve_video(case["video_path"], Path(args.videos_root))
     frames, indices, frame_meta = load_oracle_pil_frames(
@@ -146,9 +172,22 @@ def extract_question(case: dict, args) -> dict:
         beta = full_payload["beta"]
         valid = full_payload["valid"]
         _assert_beta(beta, valid)
+        gold_index = case_index(case)
+        if gold_index >= len(full["z"]) or gold_index >= len(vanilla["z"]):
+            raise RuntimeError(
+                f"{case['question_id']} gold {case.get('gold')!r} is outside the scored letters "
+                f"({len(full['z'])})."
+            )
+        _attach_margin(vanilla, gold_index)
+        _attach_margin(full, gold_index)
         selection = select_keyframes(beta[0])
+        if not selection["edges"]:
+            selection = _fallback_edges(selection, beta[0])
+        gamma = full_payload["gamma"]
         bundle = {
             "question_id": case["question_id"],
+            "question": case.get("question") or "",
+            "gold": case.get("gold"),
             "checkpoint_sha256": sha256_file(Path(args.checkpoint)),
             "localization": localization,
             "prompt": prompt,
@@ -159,20 +198,21 @@ def extract_question(case: dict, args) -> dict:
             "tokens_per_frame": tokens_per_frame,
             "alpha": alpha[0].tolist(),
             "beta": beta[0].tolist(),
-            "gamma": full_payload["gamma"][0].tolist(),
+            "gamma": None if gamma is None else gamma[0].tolist(),
             "gate": full_payload["gate"][0].tolist(),
             "residual_ratio": full_payload["residual_ratio"][0].tolist(),
             "vanilla": _pack_scores(vanilla, case, "vanilla"),
             "frameweave": _pack_scores(full, case, "frameweave"),
-            "overall_delta_z": full["z"][case_index(case)] - vanilla["z"][case_index(case)],
+            "overall_delta_z": full["z"][gold_index] - vanilla["z"][gold_index],
             "overall_delta_margin": full["margin"] - vanilla["margin"],
             "selection": _jsonify_selection(selection),
             "beta_direction": "arrow j -> i uses beta[i, j]; beta.sum(-1) == 1 on receivers with a neighbor",
             "contribution_definition": "delta_z = z_y(full) - z_y(intervened); positive supports gold",
         }
-        if not selection["sharp"] or not selection["edges"]:
+        if not selection["edges"]:
             bundle["render_allowed"] = False
-            bundle["reject_reason"] = "Cross-frame beta is not concentrated on a directed evidence edge."
+            bundle["reject_reason"] = "Cross-frame beta has no off-diagonal mass to draw."
+            bundle["interpretation"] = _interpretation(case, selection)
             return {"bundle": bundle, "frames": frames, "render": False}
 
         gold_index = case_index(case)
@@ -226,45 +266,51 @@ def extract_question(case: dict, args) -> dict:
                 }
             )
         chosen = _choose_trial(trials)
+        display = _display_trial(trials, chosen)
         bundle["k_trials"] = trials
-        bundle["chosen_k"] = None if chosen is None else chosen["k"]
-        if chosen is None:
-            bundle["render_allowed"] = False
-            bundle["reject_reason"] = (
-                "No k in {4, 8, 12} produced positive gold-logit and margin contributions "
-                "on every displayed keyframe and on the dominant directed edge."
-            )
-            return {"bundle": bundle, "frames": frames, "render": False}
-
-        raw_impacts = []
-        for impact in chosen["token_impacts"]:
-            mask = _suppress_mask(valid.shape, impact["frame"], impact["tokens"])
-            for fill in ("zero", "mean"):
-                scores = _forward(
-                    model, joining, prepared, question_hidden, timestamps, frame_mask, letter_ids,
-                    raw_mask_tokens=mask, raw_fill=fill, check_beta=True,
-                )["scores"]
-                raw_impacts.append({"frame": impact["frame"], "fill": fill, **_delta(full, scores, gold_index)})
-        bundle["raw_visual_impacts"] = raw_impacts
-        kept_edges = [
-            edge for edge in chosen["edge_impacts"]
-            if edge["pre_softmax"]["delta_z"] > 0 and edge["pre_softmax"]["delta_margin"] > 0
-        ]
-        dominant = max(chosen["edge_impacts"], key=lambda edge: edge["beta"])
-        if not (
-            dominant["pre_softmax"]["delta_z"] > 0
-            and dominant["pre_softmax"]["delta_margin"] > 0
-            and kept_edges
-            and all(item["delta_z"] > 0 and item["delta_margin"] > 0 for item in chosen["token_impacts"])
-        ):
-            bundle["render_allowed"] = False
-            bundle["reject_reason"] = "Dominant edge or a highlighted region did not support the gold logit."
-            bundle["chosen_trial"] = chosen
-            return {"bundle": bundle, "frames": frames, "render": False}
-        bundle["render_allowed"] = True
-        bundle["chosen_trial"] = chosen
-        bundle["displayed_edges"] = kept_edges
+        bundle["chosen_k"] = None if display is None else display["k"]
         bundle["interpretation"] = _interpretation(case, selection)
+        if display is None:
+            bundle["render_allowed"] = False
+            bundle["reject_reason"] = "No keyframe had pooling mass to highlight."
+            return {"bundle": bundle, "frames": frames, "render": False}
+        bundle["chosen_trial"] = display
+        passed = chosen is not None and _trial_supports_gold(chosen)
+        if passed:
+            raw_impacts = []
+            for impact in chosen["token_impacts"]:
+                mask = _suppress_mask(valid.shape, impact["frame"], impact["tokens"])
+                for fill in ("zero", "mean"):
+                    scores = _forward(
+                        model, joining, prepared, question_hidden, timestamps, frame_mask, letter_ids,
+                        raw_mask_tokens=mask, raw_fill=fill, check_beta=True,
+                    )["scores"]
+                    raw_impacts.append(
+                        {"frame": impact["frame"], "fill": fill, **_delta(full, scores, gold_index)}
+                    )
+            bundle["raw_visual_impacts"] = raw_impacts
+            bundle["displayed_edges"] = [
+                edge for edge in chosen["edge_impacts"]
+                if edge["pre_softmax"]["delta_z"] > 0 and edge["pre_softmax"]["delta_margin"] > 0
+            ]
+            bundle["render_allowed"] = True
+            bundle["reject_reason"] = ""
+        else:
+            bundle["render_allowed"] = False
+            if not selection["sharp"]:
+                bundle["reject_reason"] = (
+                    "Cross-frame beta is not concentrated on a directed evidence edge."
+                )
+            elif chosen is None:
+                bundle["reject_reason"] = (
+                    "No k in {4, 8, 12} produced positive gold-logit and margin contributions "
+                    "on every displayed keyframe and on the dominant directed edge."
+                )
+            else:
+                bundle["reject_reason"] = (
+                    "Dominant edge or a highlighted region did not support the gold logit."
+                )
+            bundle["displayed_edges"] = list(display["edge_impacts"])
         return {"bundle": bundle, "frames": frames, "render": True}
     finally:
         end_prepare_cache()
@@ -332,7 +378,7 @@ def _forward(model, joining, prepared, question_hidden, timestamps, frame_mask, 
     module = state.module
     alpha = _cpu(module.last_alpha)
     beta = _cpu(module.last_beta)
-    gamma = _cpu(module.last_gamma)
+    gamma = None if module.last_gamma is None else _cpu(module.last_gamma)
     gate = _cpu(module.last_gate)
     delta = _cpu(module.last_delta_x)
     tokens = _cpu(state.last_visual_embeds)
@@ -349,14 +395,20 @@ def _forward(model, joining, prepared, question_hidden, timestamps, frame_mask, 
     }
 
 
+def _attach_margin(scores: dict, gold_index: int) -> dict:
+    scores["margin"] = _margin(scores["z"], gold_index)
+    return scores
+
+
 def _scores(payload, letter_ids) -> dict:
     import torch
 
     step = payload.get("first_step_logits") if isinstance(payload, dict) else None
     if step is None:
         raise RuntimeError("The forward did not return first-step letter logits.")
-    ids = letter_ids.to(dtype=torch.long)
-    chosen = step.detach().float().cpu().index_select(0, ids)
+    step = step.detach().float().cpu().reshape(-1)
+    ids = letter_ids.detach().to(device=step.device, dtype=torch.long).reshape(-1)
+    chosen = step.index_select(0, ids)
     index = int(torch.argmax(chosen).item())
     gold_slot = chosen
     probs = torch.softmax(gold_slot, dim=0)
@@ -435,18 +487,53 @@ def _assert_beta(beta: np.ndarray, valid: np.ndarray) -> None:
             raise AssertionError("beta diagonal is not closed")
 
 
+def _fallback_edges(selection: dict, beta: np.ndarray) -> dict:
+    """Keep one real off-diagonal edge so a diffuse question can still be drawn."""
+    matrix = np.asarray(beta, dtype=np.float64)
+    best = None
+    frames = selection["keyframes"] or list(range(matrix.shape[0]))
+    for receiver in frames:
+        for source in frames:
+            if receiver == source:
+                continue
+            weight = float(matrix[receiver, source])
+            if best is None or weight > best["beta"]:
+                best = {"receiver": int(receiver), "source": int(source), "beta": weight}
+    if best is None or best["beta"] <= 0:
+        return selection
+    updated = dict(selection)
+    updated["edges"] = [best]
+    return updated
+
+
+def _display_trial(trials: list[dict], chosen: dict | None) -> dict | None:
+    if chosen is not None:
+        return chosen
+    for trial in trials:
+        if trial["k"] == 8 and trial["token_impacts"]:
+            return trial
+    for trial in trials:
+        if trial["token_impacts"]:
+            return trial
+    return None
+
+
+def _trial_supports_gold(trial: dict) -> bool:
+    if not trial["token_impacts"] or not trial["edge_impacts"]:
+        return False
+    if not all(item["delta_z"] > 0 and item["delta_margin"] > 0 for item in trial["token_impacts"]):
+        return False
+    if not all(item["alpha_mass"] >= 0.12 for item in trial["token_impacts"]):
+        return False
+    dominant = max(trial["edge_impacts"], key=lambda edge: edge["beta"])
+    pre = dominant["pre_softmax"]
+    return pre["delta_z"] > 0 and pre["delta_margin"] > 0
+
+
 def _choose_trial(trials: list[dict]) -> dict | None:
     viable = []
     for trial in trials:
-        if not trial["token_impacts"] or not trial["edge_impacts"]:
-            continue
-        if not all(item["delta_z"] > 0 and item["delta_margin"] > 0 for item in trial["token_impacts"]):
-            continue
-        if not all(item["alpha_mass"] >= 0.12 for item in trial["token_impacts"]):
-            continue
-        dominant = max(trial["edge_impacts"], key=lambda edge: edge["beta"])
-        pre = dominant["pre_softmax"]
-        if pre["delta_z"] > 0 and pre["delta_margin"] > 0:
+        if _trial_supports_gold(trial):
             viable.append(trial)
     if not viable:
         return None

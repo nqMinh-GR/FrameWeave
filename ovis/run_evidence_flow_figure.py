@@ -32,6 +32,9 @@ def main() -> None:
     extract = sub.add_parser("extract")
     _add_runtime(extract)
     extract.add_argument("--q-id", default="")
+    extract.add_argument("--all-tso", action="store_true")
+    extract.add_argument("--draw-all", action="store_true")
+    extract.add_argument("--skip-existing", action="store_true")
     extract.add_argument("--allow-abstention", action="store_true")
 
     render = sub.add_parser("render")
@@ -88,7 +91,7 @@ def _write_rank(workspace: Path, paper: Path) -> dict:
     path = paper / "audit" / "qual_candidates_ranked.json"
     write_json(path, report)
     print(
-        f"Wrote {path} concrete={report['n_concrete_wrong']} "
+        f"Wrote {path} n_tso={report['n_tso']} concrete={report['n_concrete_wrong']} "
         f"queue={report['render_queue']}",
         flush=True,
     )
@@ -111,59 +114,156 @@ def _check(paper: Path) -> None:
 def _extract(args) -> None:
     sys.path.insert(0, str(args.workspace / "v6_ovis"))
     from reljoin.evidence_flow.mine import default_paths
-    from reljoin.evidence_flow.signals import RuntimeBlocked, extract_question, write_json
+    from reljoin.evidence_flow.signals import RuntimeBlocked, load_runtime, write_json
 
     report_path = args.paper / "audit" / "qual_candidates_ranked.json"
-    if not report_path.is_file():
+    if not report_path.is_file() or not json.loads(report_path.read_text(encoding="utf-8")).get("all_questions"):
         _write_rank(args.workspace, args.paper)
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    question_id = _select_id(report, getattr(args, "q_id", ""), getattr(args, "allow_abstention", False), args.paper)
-    case = _find_case(report, question_id)
     if args.checkpoint is None:
         args.checkpoint = default_paths(args.workspace, args.paper)["checkpoint"]
+    draw_all = bool(getattr(args, "draw_all", False) or getattr(args, "all_tso", False))
+    if getattr(args, "all_tso", False):
+        cases = list(report.get("all_questions") or [])
+        if not cases:
+            raise SystemExit("The rank file has no TSO questions.")
+        try:
+            runtime = load_runtime(args)
+        except RuntimeBlocked as exc:
+            print("Stopped before any heatmap.", flush=True)
+            for blocker in exc.blockers:
+                print(f"- {blocker}", flush=True)
+            raise SystemExit(2) from exc
+        _extract_many(args, report, cases, draw_all, runtime, write_json)
+        return
+    question_id = _select_id(
+        report, getattr(args, "q_id", ""), getattr(args, "allow_abstention", False), args.paper
+    )
+    case = _find_case(report, question_id)
     try:
-        result = extract_question(case, args)
+        _extract_one(args, case, draw_all, None)
     except RuntimeBlocked as exc:
-        status = {
-            "question_id": question_id,
-            "render_allowed": False,
-            "blockers": exc.blockers,
-            "checkpoint_sha256_expected": report.get("checkpoint_sha256_expected"),
-            "checkpoint_sha256_actual": report.get("checkpoint_sha256_actual"),
-            "checkpoint_sha256_matches": report.get("checkpoint_sha256_matches"),
-            "vanilla_letter": case.get("vanilla_letter"),
-            "gold": case.get("gold"),
-            "hybrid_letter": case.get("hybrid_letter"),
-            "frame_timestamps": case.get("frame_timestamps"),
-            "evidence_spans": case.get("evidence_spans"),
-            "frame_source_labels": case.get("frame_source_labels"),
-            "seeds_hybrid_correct": case.get("seeds_hybrid_correct"),
-            "timestamps_match_sampler": case.get("timestamps_match_sampler"),
-            "localization": {
-                "status": "not_run",
-                "reason": "The impulse test requires the local Ovis2.5-9B weights, CUDA, and the HERBench video.",
-            },
-            "signals": None,
-            "note": "Stopped before any heatmap. No paper PDF was written.",
-        }
-        path = args.paper / "audit" / f"qual_evidence_flow_{question_id}.status.json"
-        write_json(path, status)
+        _write_blocked(args.paper, report, case, exc.blockers, write_json)
         print("Stopped before any heatmap.", flush=True)
         for blocker in exc.blockers:
             print(f"- {blocker}", flush=True)
         raise SystemExit(2) from exc
+
+
+def _extract_many(args, report, cases, draw_all, runtime, write_json) -> None:
+    import traceback
+
+    from reljoin.evidence_flow.signals import RuntimeBlocked
+
+    summary = []
+    total = len(cases)
+    for index, case in enumerate(cases, start=1):
+        question_id = case["question_id"]
+        pdf = args.paper / "figures" / "qual_evidence_flow" / f"{question_id}.pdf"
+        audit = args.paper / "audit" / f"qual_evidence_flow_{question_id}.json"
+        if getattr(args, "skip_existing", False) and pdf.is_file() and audit.is_file():
+            print(f"[{index}/{total}] skip {question_id}", flush=True)
+            saved = json.loads(audit.read_text(encoding="utf-8"))
+            summary.append({
+                "question_id": question_id,
+                "status": "skipped",
+                "render_allowed": saved.get("render_allowed"),
+                "pdf": True,
+            })
+            continue
+        print(f"[{index}/{total}] {question_id}", flush=True)
+        try:
+            bundle = _extract_one(args, case, draw_all, runtime)
+            summary.append({
+                "question_id": question_id,
+                "status": "ok",
+                "render_allowed": bundle.get("render_allowed"),
+                "pdf": pdf.is_file(),
+                "reject_reason": bundle.get("reject_reason") or "",
+                "predicted_vanilla": (bundle.get("vanilla") or {}).get("predicted_letter"),
+                "predicted_frameweave": (bundle.get("frameweave") or {}).get("predicted_letter"),
+                "gold": bundle.get("gold"),
+            })
+        except RuntimeBlocked as exc:
+            _write_blocked(args.paper, report, case, exc.blockers, write_json)
+            print(f"{question_id} blocked: {exc.blockers}", flush=True)
+            summary.append({"question_id": question_id, "status": "blocked", "blockers": exc.blockers, "pdf": False})
+        except Exception as exc:
+            traceback.print_exc()
+            _write_blocked(
+                args.paper, report, case, [f"{type(exc).__name__}: {exc}"], write_json,
+                note=traceback.format_exc(),
+            )
+            print(f"{question_id} failed: {type(exc).__name__}: {exc}", flush=True)
+            summary.append({
+                "question_id": question_id,
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "pdf": False,
+            })
+    path = args.paper / "audit" / "qual_evidence_flow_summary.json"
+    counts = {
+        "ok": sum(row["status"] == "ok" for row in summary),
+        "skipped": sum(row["status"] == "skipped" for row in summary),
+        "blocked": sum(row["status"] == "blocked" for row in summary),
+        "error": sum(row["status"] == "error" for row in summary),
+        "pdf": sum(bool(row.get("pdf")) for row in summary),
+    }
+    write_json(path, {"n_tso": total, "counts": counts, "results": summary})
+    print(f"Finished {total} TSO questions. Summary {path} counts={counts}", flush=True)
+    if counts["pdf"] == 0 and counts["error"] == total:
+        raise SystemExit(1)
+
+
+def _extract_one(args, case, draw_all: bool, runtime) -> dict:
+    from reljoin.evidence_flow.render import render_case
+    from reljoin.evidence_flow.signals import extract_question, write_json
+
+    question_id = case["question_id"]
+    result = extract_question(case, args, runtime=runtime)
     bundle = result["bundle"]
     audit = args.paper / "audit" / f"qual_evidence_flow_{question_id}.json"
     write_json(audit, bundle)
     if not result["render"]:
         print(f"No figure for {question_id}: {bundle.get('reject_reason')}", flush=True)
-        return
-    from reljoin.evidence_flow.render import render_case
-
+        return bundle
+    if not (bundle.get("render_allowed") or draw_all):
+        print(f"No paper figure for {question_id}: {bundle.get('reject_reason')}", flush=True)
+        return bundle
     tex = args.paper / "fig" / f"qual_evidence_flow_{question_id}.tex"
     pdf = args.paper / "figures" / "qual_evidence_flow" / f"{question_id}.pdf"
-    outputs = render_case(result, tex, pdf)
+    outputs = render_case(
+        result, tex, pdf, allow_candidate=not bool(bundle.get("render_allowed"))
+    )
     print(f"Wrote {outputs['pdf']}", flush=True)
+    return bundle
+
+
+def _write_blocked(paper, report, case, blockers, write_json, note: str = "") -> None:
+    question_id = case["question_id"]
+    status = {
+        "question_id": question_id,
+        "render_allowed": False,
+        "blockers": blockers,
+        "checkpoint_sha256_expected": report.get("checkpoint_sha256_expected"),
+        "checkpoint_sha256_actual": report.get("checkpoint_sha256_actual"),
+        "checkpoint_sha256_matches": report.get("checkpoint_sha256_matches"),
+        "vanilla_letter": case.get("vanilla_letter"),
+        "gold": case.get("gold"),
+        "hybrid_letter": case.get("hybrid_letter"),
+        "frame_timestamps": case.get("frame_timestamps"),
+        "evidence_spans": case.get("evidence_spans"),
+        "frame_source_labels": case.get("frame_source_labels"),
+        "seeds_hybrid_correct": case.get("seeds_hybrid_correct"),
+        "timestamps_match_sampler": case.get("timestamps_match_sampler"),
+        "localization": {
+            "status": "not_run",
+            "reason": "The impulse test requires the local Ovis2.5-9B weights, CUDA, and the HERBench video.",
+        },
+        "signals": None,
+        "note": note or "Stopped before any heatmap. No paper PDF was written.",
+    }
+    write_json(paper / "audit" / f"qual_evidence_flow_{question_id}.status.json", status)
 
 
 def _render_saved(paper: Path, question_id: str) -> None:
@@ -189,7 +289,11 @@ def _select_id(report: dict, requested: str, allow_abstention: bool, paper: Path
 
 
 def _find_case(report: dict, question_id: str) -> dict:
-    pools = list(report.get("concrete_wrong") or []) + list(report.get("abstention_flips_top10") or [])
+    pools = (
+        list(report.get("all_questions") or [])
+        + list(report.get("concrete_wrong") or [])
+        + list(report.get("abstention_flips_top10") or [])
+    )
     for row in pools:
         if row["question_id"] == question_id:
             return row

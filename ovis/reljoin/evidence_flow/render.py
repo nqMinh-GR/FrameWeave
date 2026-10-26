@@ -17,10 +17,12 @@ BLUE = "367DBD"
 FIGURE_WIDTH_CM = 17.4
 
 
-def render_case(result: dict, tex_path: Path, pdf_path: Path) -> dict:
+def render_case(result: dict, tex_path: Path, pdf_path: Path, *, allow_candidate: bool = False) -> dict:
     bundle = result["bundle"]
-    if not bundle.get("render_allowed"):
+    if not bundle.get("render_allowed") and not allow_candidate:
         raise RuntimeError(bundle.get("reject_reason") or "This question is not eligible to render.")
+    if "chosen_trial" not in bundle:
+        raise RuntimeError(bundle.get("reject_reason") or "This question has no measured trial to draw.")
     frames = result["frames"]
     trial = bundle["chosen_trial"]
     keyframes = bundle["selection"]["keyframes"]
@@ -114,7 +116,7 @@ def _tikz(bundle: dict, panels: list[Path]) -> str:
         rf"\definecolor{{vanillabad}}{{HTML}}{{{CRIMSON}}}",
         r"\begin{document}",
         rf"\begin{{tikzpicture}}[x=1cm,y=1cm,>=Stealth]",
-        rf"\node[anchor=north west,text width=17.1cm,font=\sffamily\footnotesize,align=left] at (0.1,{figure_h - 0.08:.3f}) {{\textbf{{{_escape(bundle['question_id'])} --- Temporal Shot Ordering}}\\{question}}};",
+        rf"\node[anchor=north west,text width=17.1cm,font=\sffamily\footnotesize,align=left] at (0.1,{figure_h - 0.08:.3f}) {{\textbf{{{_escape(bundle['question_id'])} --- Temporal Shot Ordering{_candidate_tag(bundle)}}}\\{question}}};",
     ]
     _timeline(lines, stamps, keyframes, y=timeline_bottom + 0.08, width=frames_width)
     rects = []
@@ -185,9 +187,17 @@ def _map_box(box, image_w, image_h, x0, y0, frame_w, frame_h):
     return fx0, fy0, fx1, fy1
 
 
+def _candidate_tag(bundle: dict) -> str:
+    if bundle.get("render_allowed", True):
+        return ""
+    return " (candidate)"
+
+
 def _arrows(lines, bundle, rects, frame_top: float) -> None:
     lookup = {item[4]: item for item in rects}
-    edges = bundle["displayed_edges"]
+    edges = bundle.get("displayed_edges") or []
+    if not edges:
+        return
     peak = max(edge["beta"] for edge in edges)
     for ordinal, edge in enumerate(edges):
         source = lookup.get(edge["source"])
@@ -227,6 +237,9 @@ def _anchor(rect, toward: float) -> tuple[float, float]:
 def _cards(lines, bundle, x, top) -> None:
     vanilla = bundle["vanilla"]
     learned = bundle["frameweave"]
+    gold = str(bundle.get("gold") or learned.get("letter") or "")
+    vanilla_letter = str(vanilla.get("predicted_letter") or vanilla["letter"])
+    learned_letter = str(learned.get("predicted_letter") or learned["letter"])
     interpretation = bundle["interpretation"]["lines"]
     body = r"\\".join(_escape(line) for line in interpretation)
     lines.append(
@@ -236,10 +249,10 @@ def _cards(lines, bundle, x, top) -> None:
     )
     answer = (
         rf"\textbf{{Answer and gold-logit shift}}\\"
-        rf"\textcolor{{vanillabad}}{{Vanilla: \(\times\) {_escape(vanilla['letter'])}}} "
+        rf"Vanilla: {_letter_mark(vanilla_letter, gold)} "
         rf"{_escape(_short(vanilla['text']))}\\"
         rf"\(z^0_y={vanilla['z_gold']:.2f}\), prob \({vanilla['prob_gold']:.2f}\)\\"
-        rf"\textcolor{{goldok}}{{FrameWeave: \(\checkmark\) {_escape(learned['letter'])}}} "
+        rf"FrameWeave: {_letter_mark(learned_letter, gold)} "
         rf"{_escape(_short(learned['text']))}\\"
         rf"\(z^\theta_y={learned['z_gold']:.2f}\), "
         rf"\(\Delta z_y={_signed(bundle['overall_delta_z'])}\)\\"
@@ -251,6 +264,13 @@ def _cards(lines, bundle, x, top) -> None:
     )
 
 
+def _letter_mark(letter: str, gold: str) -> str:
+    shown = _escape(letter or "?")
+    if gold and letter == gold:
+        return rf"\textcolor{{goldok}}{{\(\checkmark\) {shown}}}"
+    return rf"\textcolor{{vanillabad}}{{\(\times\) {shown}}}"
+
+
 def _signed(value: float) -> str:
     number = float(value)
     return f"+{number:.2f}" if number >= 0 else f"{number:.2f}"
@@ -260,7 +280,7 @@ def _short(text: str, limit: int = 72) -> str:
     collapsed = " ".join(str(text).split())
     if len(collapsed) <= limit:
         return collapsed
-    return collapsed[: limit - 1] + "…"
+    return collapsed[: limit - 3] + "..."
 
 
 def _escape(text: str) -> str:
