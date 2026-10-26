@@ -19,7 +19,7 @@ Open a notebook from this repo, then Run All. The notebook clones this repositor
 
 On the next Run All in the same runtime, the notebook runs `git pull --ff-only`. If `/content/reljoin` is a real uploaded folder, restart the runtime before Run All.
 
-Checkpoints, datasets, and model weights are not in git. Eval notebooks still read them from `/content` or Google Drive. The TSO evidence-flow notebook uses the published `checkpoints/ovis/best_external_val/Hybrid.pt` and the logs in `ovis/assets/evidence_flow/`. It downloads Ovis weights and HERBench videos from Hugging Face, then draws one figure for every Temporal Shot Ordering question.
+Checkpoints, datasets, and model weights are not in git. Eval notebooks still read them from `/content` or Google Drive. The TSO evidence-flow notebook uses the published `checkpoints/ovis/best_external_val/Hybrid.pt` and the logs in `ovis/assets/evidence_flow/`. It downloads Ovis weights and HERBench videos from Hugging Face, draws one figure for every Temporal Shot Ordering question, and downloads a zip. It does not edit the paper.
 
 ### Qwen
 

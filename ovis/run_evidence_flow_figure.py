@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Build one HERBench TSO evidence-flow figure at a time.
+"""Build HERBench TSO evidence-flow figures outside the paper.
 
-The default command ranks the 152 TSO questions, checks the merge-order
-arithmetic, then tries to extract the next concrete-wrong question. If Ovis
-weights, CUDA, or the video are missing, it stops without drawing a figure.
-``install`` is the only command that edits the paper.
+Figures, TeX, and JSON are written under ``--paper``, which is an output
+directory and is not the paper tree. This command never edits the paper.
 """
 from __future__ import annotations
 
@@ -14,7 +12,7 @@ import sys
 from pathlib import Path
 
 WORKSPACE = Path("/home/quangminh/Documents/DATN/Thí Nghiệm")
-PAPER = Path("/home/quangminh/Documents/DATN/CVPR")
+PAPER = Path("/tmp/evidence_flow_out")
 
 
 def main() -> None:
@@ -59,9 +57,9 @@ def main() -> None:
     elif command == "render":
         _render_saved(args.paper, args.q_id)
     elif command == "install":
-        from reljoin.evidence_flow.install import install_question
-
-        install_question(args.paper, args.q_id)
+        raise SystemExit(
+            "Paper install is disabled. Figures stay in the output directory so they can be chosen by hand."
+        )
     elif command == "run":
         _write_rank(args.workspace, args.paper)
         _check(args.paper)
@@ -102,7 +100,8 @@ def _check(paper: Path) -> None:
     sys.path.insert(0, str(WORKSPACE / "v6_ovis"))
     from reljoin.evidence_flow.checks import run_intervention_checks, run_static_checks
 
-    run_static_checks(paper)
+    del paper
+    run_static_checks(None)
     try:
         import torch  # noqa: F401
     except ImportError:
@@ -228,7 +227,7 @@ def _extract_one(args, case, draw_all: bool, runtime) -> dict:
         print(f"No figure for {question_id}: {bundle.get('reject_reason')}", flush=True)
         return bundle
     if not (bundle.get("render_allowed") or draw_all):
-        print(f"No paper figure for {question_id}: {bundle.get('reject_reason')}", flush=True)
+        print(f"No figure for {question_id}: {bundle.get('reject_reason')}", flush=True)
         return bundle
     tex = args.paper / "fig" / f"qual_evidence_flow_{question_id}.tex"
     pdf = args.paper / "figures" / "qual_evidence_flow" / f"{question_id}.pdf"
@@ -261,7 +260,7 @@ def _write_blocked(paper, report, case, blockers, write_json, note: str = "") ->
             "reason": "The impulse test requires the local Ovis2.5-9B weights, CUDA, and the HERBench video.",
         },
         "signals": None,
-        "note": note or "Stopped before any heatmap. No paper PDF was written.",
+        "note": note or "Stopped before any heatmap. No PDF was written.",
     }
     write_json(paper / "audit" / f"qual_evidence_flow_{question_id}.status.json", status)
 
