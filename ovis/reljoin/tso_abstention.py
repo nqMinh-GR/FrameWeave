@@ -15,7 +15,6 @@ import zipfile
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
 from .config import HERBENCH_ORACLE_FRAMES
 from .herbench_oracle import EXPECTED_TSO_N, TSO_TASK, is_tso_task
@@ -226,6 +225,8 @@ def select_zip_member(names: list[str]) -> str:
 
 
 def load_source_table(path: Path) -> tuple[pd.DataFrame, str]:
+    import pandas as pd
+
     path = Path(path)
     if not path.is_file():
         raise ProtocolError(f"results path not found: {path}")
@@ -767,6 +768,8 @@ def append_jsonl(path: Path, record: dict) -> None:
 
 
 def load_prediction_rows(path: Path) -> list[dict]:
+    import pandas as pd
+
     path = Path(path)
     if not path.is_file() or path.stat().st_size == 0:
         return []

@@ -12,8 +12,6 @@ from pathlib import Path
 
 import numpy as np
 
-from .frame_io import frames_to_pil
-
 
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -240,6 +238,8 @@ def load_oracle_pil_frames(
         "frame_indices": indices,
         "frame_times": times,
     }
+    from .frame_io import frames_to_pil
+
     return frames_to_pil(rgb), indices, meta
 
 

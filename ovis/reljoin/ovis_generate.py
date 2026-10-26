@@ -75,6 +75,12 @@ def generate_ovis(
     prepared: tuple | None = None,
     return_scores: bool = False,
     blocked_sources=None,
+    suppress_tokens=None,
+    blocked_edges=None,
+    edge_ablation: str = "pre_softmax",
+    check_beta: bool = False,
+    raw_mask_tokens=None,
+    raw_fill: str = "zero",
 ) -> Any:
     """Greedy letter generation for HERBench oracle eval.
 
@@ -95,6 +101,12 @@ def generate_ovis(
         eval_mode=eval_mode or "full",
         inject_delta=inject_delta,
         blocked_sources=blocked_sources,
+        suppress_tokens=suppress_tokens,
+        blocked_edges=blocked_edges,
+        edge_ablation=edge_ablation,
+        check_beta=check_beta,
+        raw_mask_tokens=raw_mask_tokens,
+        raw_fill=raw_fill,
     )
     set_reljoin_context(
         question_hidden=question_hidden,

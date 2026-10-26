@@ -69,6 +69,76 @@ def block_read_sources(pair_mask: torch.Tensor, sources) -> torch.Tensor:
         out[:, receiver, j] = False
     return out
 
+
+def block_directed_edges(pair_mask: torch.Tensor, edges) -> torch.Tensor:
+    """Close one directed read at a time.
+
+    ``beta[i, j]`` is the weight of the arrow ``j -> i``: row ``i`` is the
+    receiver and column ``j`` is the source being read. An empty edge list
+    returns ``pair_mask``. The diagonal stays closed.
+    """
+    if not edges:
+        return pair_mask
+    out = pair_mask.clone()
+    k = int(out.shape[-1])
+    for raw in edges:
+        receiver, source = int(raw[0]), int(raw[1])
+        if receiver < 0 or source < 0 or receiver >= k or source >= k:
+            raise ValueError(f"directed edge {(receiver, source)} is outside 0..{k - 1}")
+        if receiver == source:
+            raise ValueError(f"directed edge {(receiver, source)} is on the diagonal")
+        out[:, receiver, source] = False
+    return out
+
+
+def zero_beta_edges(beta: torch.Tensor, edges) -> torch.Tensor:
+    """Post-softmax removal. ``beta[i, j] <- 0`` does not renormalize the row."""
+    if not edges:
+        return beta
+    out = beta.clone()
+    k = int(out.shape[-1])
+    for raw in edges:
+        receiver, source = int(raw[0]), int(raw[1])
+        if not (0 <= receiver < k and 0 <= source < k):
+            raise ValueError(f"directed edge {(receiver, source)} is outside 0..{k - 1}")
+        out[:, receiver, source] = 0
+    return out
+
+
+def zero_gamma_edges(gamma: torch.Tensor, edges) -> torch.Tensor:
+    """Post-softmax removal. ``gamma[b, i, p, j] <- 0`` for arrow ``j -> i``."""
+    if not edges:
+        return gamma
+    out = gamma.clone()
+    k = int(out.shape[1])
+    for raw in edges:
+        receiver, source = int(raw[0]), int(raw[1])
+        if not (0 <= receiver < k and 0 <= source < k):
+            raise ValueError(f"directed edge {(receiver, source)} is outside 0..{k - 1}")
+        out[:, receiver, :, source] = 0
+    return out
+
+
+def assert_beta_receiver_rows(
+    beta: torch.Tensor,
+    pair_mask: torch.Tensor,
+    tol: float = 1e-4,
+) -> None:
+    """Arrow ``j -> i`` uses ``beta[i, j]``. Receiver rows with a source sum to 1."""
+    sums = beta.detach().float().sum(dim=-1)
+    has = pair_mask.any(dim=-1)
+    if bool(has.any()):
+        err = (sums[has] - 1).abs().max()
+        if float(err) > tol:
+            raise AssertionError(
+                "beta[i, j] must sum to 1 over source j for each receiver i "
+                f"with a neighbor. max |sum-1|={float(err):.6g}"
+            )
+    diag = beta.detach().float().diagonal(dim1=-2, dim2=-1).abs().max()
+    if float(diag) > tol:
+        raise AssertionError(f"beta diagonal must be 0, max={float(diag):.6g}")
+
+
 TIME_HYBRID = "hybrid"
 TIME_ZERO = "zero"
 TIME_DIM = 4
@@ -270,6 +340,7 @@ class GlobalRelation(nn.Module):
         q: torch.Tensor,
         phi: torch.Tensor,
         pair_mask: torch.Tensor,
+        post_zero_edges=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         Q = self.W_Q(s_bar) + self.U_Q(q)[:, None, :]
         k_pair = self.W_K(s_bar)[:, None, :, :] + self.A_K(phi)
@@ -278,6 +349,8 @@ class GlobalRelation(nn.Module):
         global_logits = torch.einsum("bkr,bkjr->bkj", Q, k_pair) / scale
         global_logits = global_logits - self.a_b(phi).squeeze(-1)
         beta = masked_softmax(global_logits, pair_mask, dim=-1)
+        if post_zero_edges:
+            beta = zero_beta_edges(beta, post_zero_edges)
         r_global = torch.einsum("bkj,bkjr->bkr", beta, v_pair)
         has_neighbor = pair_mask.any(dim=-1)
         r_global = r_global * has_neighbor.unsqueeze(-1).to(dtype=r_global.dtype)
@@ -361,6 +434,7 @@ class LocalRelation(nn.Module):
         pair_mask: torch.Tensor,
         *,
         chunk_p: int = 0,
+        post_zero_edges=None,
     ) -> dict[str, torch.Tensor | float]:
         B, K, P, dr = v.shape
         nu = self.ln_L(v)
@@ -434,6 +508,8 @@ class LocalRelation(nn.Module):
         frame_logits = global_logits[:, :, None, :] + ell
         frame_mask_tok = token_mask.unsqueeze(-1) & pair_mask.unsqueeze(2)
         gamma = masked_softmax(frame_logits, frame_mask_tok, dim=-1)
+        if post_zero_edges:
+            gamma = zero_gamma_edges(gamma, post_zero_edges)
         r_local = torch.einsum("bipj,bipjr->bipr", gamma, g)
         has_neighbor = pair_mask.any(dim=-1)
         valid = token_mask & has_neighbor.unsqueeze(-1)
@@ -504,7 +580,7 @@ class HybridResidualHead(nn.Module):
         delta_x = valid.to(dtype=torch.float32) * a.float() * c * u.float()
         x_tilde = frame_tokens + delta_x.to(dtype=frame_tokens.dtype)
         stats = _collect_stats(delta_x, a, c, sx, token_mask, has_neighbor, self.rms_eps)
-        extras = {"base_h": base_h, "local_h": local_h}
+        extras = {"base_h": base_h, "local_h": local_h, "gate": a.detach()}
         return x_tilde, delta_x, stats, extras
 
 
@@ -557,6 +633,7 @@ class RelJoinResidual(nn.Module):
         self.last_tau: Optional[torch.Tensor] = None
         self.last_rho: Optional[torch.Tensor] = None
         self.last_local_logits: Optional[torch.Tensor] = None
+        self.last_gate: Optional[torch.Tensor] = None
 
     def reset_parameters(self) -> None:
         self.apply(init_xavier)
@@ -633,6 +710,9 @@ class RelJoinResidual(nn.Module):
         self.last_tau = None
         self.last_rho = None
         self.last_local_logits = None
+        self.last_gate = torch.zeros(
+            B, K, P, 1, device=frame_tokens.device, dtype=frame_tokens.dtype
+        )
 
     def _time_features(
         self,
@@ -662,12 +742,32 @@ class RelJoinResidual(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         blocked_sources = kwargs.pop("blocked_sources", None)
+        suppress_tokens = kwargs.pop("suppress_tokens", None)
+        blocked_edges = kwargs.pop("blocked_edges", None)
+        edge_ablation = str(kwargs.pop("edge_ablation", "pre_softmax") or "pre_softmax")
+        check_beta = bool(kwargs.pop("check_beta", False))
         del kwargs
         mode = (eval_mode or EVAL_FULL).strip().lower()
         if mode not in EVAL_MODES:
             raise ValueError(f"Unknown eval_mode {eval_mode!r}. Expected {EVAL_MODES}")
+        edge_mode = edge_ablation.strip().lower()
+        if edge_mode not in ("pre_softmax", "post_softmax"):
+            raise ValueError(
+                f"Unknown edge_ablation {edge_ablation!r}. Expected pre_softmax or post_softmax."
+            )
 
         token_mask = token_mask.to(dtype=torch.bool)
+        if suppress_tokens is not None:
+            suppress = suppress_tokens.to(device=token_mask.device, dtype=torch.bool)
+            if suppress.shape == token_mask.shape[1:]:
+                suppress = suppress.unsqueeze(0).expand_as(token_mask)
+            if suppress.shape != token_mask.shape:
+                raise ValueError(
+                    f"suppress_tokens shape {tuple(suppress.shape)} != token_mask {tuple(token_mask.shape)}"
+                )
+            active_mask = token_mask & ~suppress
+        else:
+            active_mask = token_mask
         frame_mask = frame_mask.to(dtype=torch.bool) & token_mask.any(dim=-1)
 
         if mode == EVAL_IDENTITY:
@@ -678,10 +778,16 @@ class RelJoinResidual(nn.Module):
         pair_mask = pair_mask_from_frames(frame_mask)
         if blocked_sources:
             pair_mask = block_read_sources(pair_mask, blocked_sources)
+        post_edges = None
+        if blocked_edges:
+            if edge_mode == "pre_softmax":
+                pair_mask = block_directed_edges(pair_mask, blocked_edges)
+            else:
+                post_edges = list(blocked_edges)
         has_neighbor = pair_mask.any(dim=-1)
 
         q = self.encode_question(question_hidden)
-        s, alpha, v = self.frame_pooler(frame_tokens, token_mask, q, frame_mask)
+        s, alpha, v = self.frame_pooler(frame_tokens, active_mask, q, frame_mask)
         tau, rho, phi = self._time_features(timestamps.to(dtype=s.dtype), frame_mask, s.dtype)
         abs_pos = self.abs_position(torch.stack([tau, rho], dim=-1))
         abs_pos = abs_pos * frame_mask.unsqueeze(-1).to(dtype=abs_pos.dtype)
@@ -692,8 +798,10 @@ class RelJoinResidual(nn.Module):
         time_value_ratio = 0.0
         if self.use_global:
             global_logits, beta, r_global, has_neighbor = self.global_relation(
-                s_bar, q, phi, pair_mask
+                s_bar, q, phi, pair_mask, post_zero_edges=post_edges
             )
+            if check_beta and post_edges is None:
+                assert_beta_receiver_rows(beta, pair_mask)
             content_m, temporal_m = self.global_relation.logit_parts(s_bar, q, phi, pair_mask)
             time_key_ratio, time_value_ratio = self.global_relation.time_ratios(
                 s_bar, phi, pair_mask, self.rms_eps
@@ -716,9 +824,10 @@ class RelJoinResidual(nn.Module):
                 r_global=r_global,
                 q=q,
                 global_logits=global_logits,
-                token_mask=token_mask,
+                token_mask=active_mask,
                 pair_mask=pair_mask,
                 chunk_p=self.local_token_chunk,
+                post_zero_edges=post_edges,
             )
             r_local = local_out["r_local"]
             gamma = local_out["gamma"]
@@ -732,7 +841,7 @@ class RelJoinResidual(nn.Module):
             )
 
         x_tilde, delta_x, stats, extras = self.head(
-            frame_tokens, v, s_bar, r_global, r_local, q, token_mask, has_neighbor
+            frame_tokens, v, s_bar, r_global, r_local, q, active_mask, has_neighbor
         )
         if not bool(torch.isfinite(delta_x).all()):
             raise RuntimeError("Non-finite residual")
@@ -796,6 +905,7 @@ class RelJoinResidual(nn.Module):
         self.last_tau = tau.detach()
         self.last_rho = rho.detach()
         self.last_local_logits = None if ell is None else ell.detach()
+        self.last_gate = extras["gate"].detach()
         return x_tilde
 
 

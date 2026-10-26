@@ -49,6 +49,12 @@ class RelJoinHookState:
     last_token_mask: Optional[torch.Tensor] = None
     inject_delta: Optional[torch.Tensor] = None  # pre-scaled residual; None = run the head
     blocked_sources: Optional[tuple] = None  # read-source block; None = official pair mask
+    suppress_tokens: Optional[torch.Tensor] = None  # [K,P] or [B,K,P]; None = no token ablation
+    blocked_edges: Optional[tuple] = None  # ((receiver, source), ...); arrow source -> receiver
+    edge_ablation: str = "pre_softmax"
+    check_beta: bool = False
+    raw_mask_tokens: Optional[torch.Tensor] = None  # zero/mean the delivered visual tokens
+    raw_fill: str = "zero"
 
 
 _HOOK_STATE = RelJoinHookState()
@@ -87,6 +93,12 @@ def configure_reljoin(
     eval_mode: str = "full",
     inject_delta: Optional[torch.Tensor] = None,
     blocked_sources: Optional[tuple] = None,
+    suppress_tokens: Optional[torch.Tensor] = None,
+    blocked_edges: Optional[tuple] = None,
+    edge_ablation: str = "pre_softmax",
+    check_beta: bool = False,
+    raw_mask_tokens: Optional[torch.Tensor] = None,
+    raw_fill: str = "zero",
 ) -> None:
     st = _HOOK_STATE
     st.module = module
@@ -98,6 +110,15 @@ def configure_reljoin(
         st.blocked_sources = tuple(int(j) for j in blocked_sources)
     else:
         st.blocked_sources = None
+    st.suppress_tokens = suppress_tokens
+    if blocked_edges:
+        st.blocked_edges = tuple((int(i), int(j)) for i, j in blocked_edges)
+    else:
+        st.blocked_edges = None
+    st.edge_ablation = edge_ablation or "pre_softmax"
+    st.check_beta = bool(check_beta)
+    st.raw_mask_tokens = raw_mask_tokens
+    st.raw_fill = raw_fill or "zero"
 
 
 def hook_install_count() -> int:
@@ -626,6 +647,40 @@ def encode_question_hidden(
     return hidden.to(dtype=dtype)
 
 
+def _apply_raw_visual_mask(x_tilde, token_mask, raw_mask, fill: str):
+    """Replace selected delivered visual tokens with zeros or the kept-token mean.
+
+    This is the secondary out-of-distribution mask. It is not the adapter-internal
+    ablation, which never writes these values into the frozen LLM.
+    """
+    raw = raw_mask.to(device=x_tilde.device, dtype=torch.bool)
+    if raw.shape == token_mask.shape[1:]:
+        raw = raw.unsqueeze(0).expand_as(token_mask)
+    if raw.shape != token_mask.shape:
+        raise ValueError(
+            f"raw_mask_tokens shape {tuple(raw.shape)} != token_mask {tuple(token_mask.shape)}"
+        )
+    raw = raw & token_mask
+    out = x_tilde.clone()
+    mode = (fill or "zero").strip().lower()
+    if mode not in ("zero", "mean"):
+        raise ValueError(f"raw_fill must be zero or mean, got {fill!r}")
+    if mode == "zero":
+        return out.masked_fill(raw.unsqueeze(-1), 0)
+    for b in range(out.shape[0]):
+        for i in range(out.shape[1]):
+            drop = raw[b, i]
+            keep = token_mask[b, i] & ~raw[b, i]
+            if not bool(drop.any()):
+                continue
+            if bool(keep.any()):
+                mu = out[b, i, keep].float().mean(dim=0)
+                out[b, i, drop] = mu.to(dtype=out.dtype)
+            else:
+                out[b, i, drop] = 0
+    return out
+
+
 def _apply_reljoin(
     model: nn.Module,
     input_ids: torch.Tensor,
@@ -723,6 +778,13 @@ def _apply_reljoin(
         forward_kwargs = {}
         if st.blocked_sources:
             forward_kwargs["blocked_sources"] = st.blocked_sources
+        if st.suppress_tokens is not None:
+            forward_kwargs["suppress_tokens"] = st.suppress_tokens
+        if st.blocked_edges:
+            forward_kwargs["blocked_edges"] = st.blocked_edges
+            forward_kwargs["edge_ablation"] = st.edge_ablation
+        if st.check_beta:
+            forward_kwargs["check_beta"] = True
         x_tilde = st.module(
             frame_tokens=frame_tokens.float(),
             token_mask=token_mask,
@@ -739,6 +801,8 @@ def _apply_reljoin(
             f"RelJoin-Residual changed token shape {tuple(frame_tokens.shape)} "
             f"→ {tuple(x_tilde.shape)}"
         )
+    if st.raw_mask_tokens is not None:
+        x_tilde = _apply_raw_visual_mask(x_tilde, token_mask, st.raw_mask_tokens, st.raw_fill)
     x_tilde = x_tilde.to(dtype=embeds.dtype)
     new_embeds = embeds.clone()
     new_embeds = scatter_variable_frame_tokens(new_embeds, spans, x_tilde)
