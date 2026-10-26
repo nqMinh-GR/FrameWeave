@@ -2,11 +2,10 @@
 
 The merge order is the one in ``modeling_ovis2_5.VisualTokenizer.preprocess``:
 patches are grouped as ``(merged_row, merged_col, sub_row, sub_col)`` with
-``hidden_stride`` 2, then every ``stride**2`` consecutive ViT patches become
-one token in row-major order over the merged grid. ``Siglip2Encoder`` restores
-``window_index`` before that reshape, so the token index is the pre-window
-group index. ``verified_token_boxes`` uses that index. The impulse test aborts
-if the live vision tower disagrees by one merged cell.
+``hidden_stride`` 2, then every ``stride**2`` consecutive patches become one
+token in row-major order over the merged grid. ``verified_token_boxes`` uses
+that index. The impulse test checks this preprocess tensor. The softmax head
+is not a spatial index, because attention moves a corner impulse to other tokens.
 """
 from __future__ import annotations
 
@@ -198,10 +197,11 @@ def run_merge_order_self_test() -> dict:
 
 
 def run_localization_test(model, *, min_pixels: int = MIN_PIXELS, max_pixels: int = MAX_PIXELS) -> dict:
-    """Impulse images through the live processor, ViT, and 2×2 merger.
+    """Impulse images through the live Ovis preprocess and 2×2 patch grouping.
 
-    Aborts if the merged token with the largest deviation from a neutral frame
-    is not the analytically predicted cell.
+    The merged-token index is the order of ``VisualTokenizer.preprocess`` after
+    grouping every ``hidden_stride**2`` patches. The softmax head is not a
+    spatial index: attention mixes a corner impulse into other tokens.
     """
     if model is None:
         raise ModelRequired(
@@ -230,22 +230,27 @@ def run_localization_test(model, *, min_pixels: int = MIN_PIXELS, max_pixels: in
     token_h, token_w = grid_h // stride, grid_w // stride
     probes = [(0, 0), (token_h - 1, token_w - 1), (max(token_h // 3, 1), max(token_w // 5, 1))]
     background = _neutral_image(raw_hw)
-    base = _merged_features(model, background, min_pixels, max_pixels)
+    base, live_grid = _merged_preprocess_features(model, background, min_pixels, max_pixels)
+    if tuple(live_grid) != (1, grid_h, grid_w):
+        raise AlignmentError(
+            f"preprocess grid_thw {live_grid} != traced {(1, grid_h, grid_w)}"
+        )
     if int(base.shape[0]) != token_h * token_w:
         raise AlignmentError(
-            f"merger returned {int(base.shape[0])} tokens, expected {token_h * token_w}"
+            f"preprocess returned {int(base.shape[0])} merged tokens, expected {token_h * token_w}"
         )
     checked = []
     for merged_row, merged_col in probes:
         expected = merged_row * token_w + merged_col
         image = _paint_box(background, boxes[expected])
-        feat = _merged_features(model, image, min_pixels, max_pixels)
+        feat, _grid = _merged_preprocess_features(model, image, min_pixels, max_pixels)
         delta = np.linalg.norm(feat - base, axis=-1)
         winner = int(np.argmax(delta))
         if winner != expected:
+            top = [int(i) for i in np.argsort(-delta)[:5]]
             raise AlignmentError(
                 f"impulse at merged cell {(merged_row, merged_col)} "
-                f"peaked at token {winner}, expected {expected}"
+                f"peaked at token {winner}, expected {expected}, top={top}"
             )
         checked.append(
             {
@@ -257,7 +262,7 @@ def run_localization_test(model, *, min_pixels: int = MIN_PIXELS, max_pixels: in
         )
     return {
         "status": "pass",
-        "scope": "processor_vit_merger",
+        "scope": "preprocess_patch_groups",
         "patch_size": patch,
         "hidden_stride": stride,
         "resized_hw": [resized_h, resized_w],
@@ -323,17 +328,15 @@ def _paint_box(image, box: np.ndarray):
     return painted
 
 
-def _merged_features(model, image, min_pixels: int, max_pixels: int) -> np.ndarray:
-    import torch
-
+def _merged_preprocess_features(model, image, min_pixels: int, max_pixels: int):
+    """Group the live preprocess tensor the same way the 2×2 merger does."""
     vt = model.visual_tokenizer
     pixels, grid = vt.preprocess(image=image, min_pixels=min_pixels, max_pixels=max_pixels)
-    device = model.device
-    pixels = pixels.to(device=device, dtype=getattr(model, "dtype", pixels.dtype))
-    grid = grid.to(device)
-    with torch.inference_mode():
-        tokens = vt(pixels, grid)
-    feat = tokens.detach().float().cpu().numpy()
-    if feat.ndim != 2:
-        raise AlignmentError(f"visual tokens have shape {feat.shape}")
-    return feat
+    stride = int(vt.vit.config.hidden_stride)
+    flat = pixels.detach().float().cpu().numpy()
+    group = stride * stride
+    if flat.ndim != 2 or flat.shape[0] % group != 0:
+        raise AlignmentError(f"preprocess patches have shape {flat.shape} for stride {stride}")
+    grouped = flat.reshape(-1, group, flat.shape[-1]).reshape(flat.shape[0] // group, -1)
+    grid_list = [int(v) for v in grid.detach().cpu().reshape(-1).tolist()[-3:]]
+    return grouped, tuple(grid_list)
