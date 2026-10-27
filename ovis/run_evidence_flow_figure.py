@@ -284,7 +284,7 @@ def _keep_existing(args, pdf: Path, audit: Path, full_png: Path | None = None) -
             return False
         if not saved.get("qualified"):
             return True
-        if saved.get("layout") != "token_row8":
+        if saved.get("layout") != "token_row8_pairs":
             return False
         return pdf.is_file() and full_png is not None and full_png.is_file()
     if not pdf.is_file():

@@ -15,7 +15,7 @@ BLUE = "367DBD"
 FIGURE_WIDTH_CM = 17.4
 CONTENT_WIDTH_CM = 17.0
 LEFT_CM = 0.2
-LINE_CM = 0.28
+LINE_CM = 0.282
 
 
 def render_case(result: dict, tex_path: Path, pdf_path: Path, *, allow_candidate: bool = False) -> dict:
@@ -60,25 +60,19 @@ def _tikz(bundle: dict, panels: list[Path]) -> str:
     sample.close()
     frame_w, frame_h, gap = _frame_geometry(len(panels), aspect)
     question = _plain(bundle.get("question") or "")
-    choice_body, choice_lines = _choice_line(bundle)
-    answer_body = _answer_line(bundle)
+    header, header_lines = _header(bundle, question)
     edges = [
         edge for edge in (bundle.get("displayed_edges") or [])
         if int(edge["source"]) in keyframes and int(edge["receiver"]) in keyframes
     ]
-    question_lines = _estimate_lines(f"{bundle['question_id']} {question}", 128)
-    question_h = LINE_CM * question_lines
-    choice_h = LINE_CM * choice_lines
-    answer_h = LINE_CM
+    header_h = LINE_CM * header_lines
     arrow_band = 0.16 if not edges else 0.70
     bottom = 0.04
     frame_bottom = bottom
     frame_top = frame_bottom + frame_h
-    figure_h = 0.04 + question_h + choice_h + answer_h + 0.06 + arrow_band + frame_h + bottom
-    question_y = figure_h - 0.02
-    choice_y = question_y - question_h
-    answer_y = choice_y - choice_h
-    text = r"font=\sffamily\scriptsize,align=left,inner sep=0pt"
+    figure_h = 0.02 + header_h + 0.04 + arrow_band + frame_h + bottom
+    header_y = figure_h - 0.01
+    text = r"font=\fontsize{7}{8}\selectfont\sffamily,align=left,inner sep=0pt"
     lines = [
         r"\documentclass[tikz,border=1pt]{standalone}",
         r"\usepackage[T1]{fontenc}",
@@ -94,11 +88,7 @@ def _tikz(bundle: dict, panels: list[Path]) -> str:
         r"\begin{document}",
         r"\begin{tikzpicture}[x=1cm,y=1cm,>=Stealth]",
         rf"\node[anchor=north west,text width={CONTENT_WIDTH_CM:.2f}cm,{text}] "
-        rf"at ({LEFT_CM:.2f},{question_y:.3f}) {{\textbf{{{_escape(bundle['question_id'])}}} {_escape(question)}}};",
-        rf"\node[anchor=north west,text width={CONTENT_WIDTH_CM:.2f}cm,{text}] "
-        rf"at ({LEFT_CM:.2f},{choice_y:.3f}) {{{choice_body}}};",
-        rf"\node[anchor=north west,text width={CONTENT_WIDTH_CM:.2f}cm,{text}] "
-        rf"at ({LEFT_CM:.2f},{answer_y:.3f}) {{{answer_body}}};",
+        rf"at ({LEFT_CM:.2f},{header_y:.3f}) {{{header}}};",
     ]
     rects = []
     row_width = len(panels) * frame_w + max(len(panels) - 1, 0) * gap
@@ -122,7 +112,25 @@ def _tikz(bundle: dict, panels: list[Path]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _choice_line(bundle: dict) -> tuple[str, int]:
+def _header(bundle: dict, question: str) -> tuple[str, int]:
+    """Question, then two tight lines of two choices, then the two model answers."""
+    question_lines = _estimate_lines(f"{bundle['question_id']} {question}", 128)
+    choices = _shown_choices(bundle)
+    rows = []
+    row_lines = 0
+    for start in (0, 2):
+        pair = [item for item in choices[start:start + 2] if item]
+        rows.append(r"\quad ".join(_escape(item) for item in pair))
+        row_lines += _estimate_lines("  ".join(pair), 140) if pair else 1
+    answer = _answer_line(bundle)
+    body = (
+        rf"\textbf{{{_escape(bundle['question_id'])}}} {_escape(question)}\\[0pt]"
+        rf"{rows[0]}\\[0pt]{rows[1]}\\[0pt]{answer}"
+    )
+    return body, question_lines + row_lines + 1
+
+
+def _shown_choices(bundle: dict) -> list[str]:
     shown = []
     for index, raw in enumerate(list(bundle.get("choices") or [])[:4]):
         letter = chr(ord("A") + index)
@@ -131,10 +139,7 @@ def _choice_line(bundle: dict) -> tuple[str, int]:
         if not (text.upper().startswith(prefix.upper()) or text.upper().startswith(f"{letter} ")):
             text = prefix + text
         shown.append(text)
-    if not shown:
-        return "", 1
-    body = r" \quad ".join(_escape(item) for item in shown)
-    return body, _estimate_lines("    ".join(shown), 150)
+    return shown
 
 
 def _answer_line(bundle: dict) -> str:
@@ -338,7 +343,7 @@ def render_layout_smoke(out_dir: Path) -> None:
         boxes.append(frame_boxes)
     bundle = {
         "example": True,
-        "layout": "token_row8",
+        "layout": "token_row8_pairs",
         "question_id": "TSO_LAYOUT_SMOKE",
         "question": (
             "SYNTHETIC LAYOUT CHECK for a 100% compact example. "
@@ -381,6 +386,10 @@ def render_layout_smoke(out_dir: Path) -> None:
     for forbidden in (r"\beta", r"\Delta", "candidate", "Visual reading", "Top-", "margin", "t_1"):
         if forbidden in tex:
             raise AssertionError(f"compact layout still contains {forbidden}")
+    pair_break = tex.find(r"A. 1->2->3->4")
+    second_row = tex.find(r"C. 4->3->1->2")
+    if pair_break < 0 or second_row < pair_break or r"\\[0pt]" not in tex[pair_break:second_row]:
+        raise AssertionError("choices must be two tight lines of two answers")
     if tex.count(r"\includegraphics") != 8:
         raise AssertionError("the paper row must show all 8 frames")
     if tex.count("rectangle") < 8:

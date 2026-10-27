@@ -550,7 +550,7 @@ def _live_result(case, args, frames, indices, frame_meta, localization, vanilla_
         },
         "csv_vanilla_letter": case.get("vanilla_letter") or "",
         "csv_hybrid_letter": case.get("hybrid_letter") or "",
-        "layout": "token_row8",
+        "layout": "token_row8_pairs",
         "render_allowed": False,
         "reject_reason": "",
     }
@@ -585,7 +585,7 @@ def _example_result(case, args, frames, indices, frame_meta, localization, paylo
     keyframes, edges = _row_exchange(beta)
     bundle = {
         "example": True,
-        "layout": "token_row8",
+        "layout": "token_row8_pairs",
         "question_id": case["question_id"],
         "task_type": case.get("task_type") or "",
         "question": case.get("question") or "",
