@@ -1,4 +1,4 @@
-"""Compact example figure: question, five choices, two answers, frames, and arrows."""
+"""Paper row: small question, four choices, two answers, eight token frames."""
 from __future__ import annotations
 
 import shutil
@@ -15,7 +15,7 @@ BLUE = "367DBD"
 FIGURE_WIDTH_CM = 17.4
 CONTENT_WIDTH_CM = 17.0
 LEFT_CM = 0.2
-LINE_CM = 0.36
+LINE_CM = 0.28
 
 
 def render_case(result: dict, tex_path: Path, pdf_path: Path, *, allow_candidate: bool = False) -> dict:
@@ -60,22 +60,25 @@ def _tikz(bundle: dict, panels: list[Path]) -> str:
     sample.close()
     frame_w, frame_h, gap = _frame_geometry(len(panels), aspect)
     question = _plain(bundle.get("question") or "")
-    choices = _choice_lines(bundle)
+    choice_body, choice_lines = _choice_line(bundle)
+    answer_body = _answer_line(bundle)
     edges = [
         edge for edge in (bundle.get("displayed_edges") or [])
         if int(edge["source"]) in keyframes and int(edge["receiver"]) in keyframes
-    ][:2]
-    question_lines = 1 + _estimate_lines(question, 92)
-    question_h = LINE_CM * question_lines + 0.08
-    option_heights = [LINE_CM * count + 0.05 for _text, count in choices]
-    option_h = sum(option_heights)
-    arrow_band = 0.18 if not edges else 0.72 + 0.34 * (len(edges) - 1)
-    bottom = 0.12
+    ]
+    question_lines = _estimate_lines(f"{bundle['question_id']} {question}", 128)
+    question_h = LINE_CM * question_lines
+    choice_h = LINE_CM * choice_lines
+    answer_h = LINE_CM
+    arrow_band = 0.16 if not edges else 0.70
+    bottom = 0.04
     frame_bottom = bottom
     frame_top = frame_bottom + frame_h
-    figure_h = 0.10 + question_h + option_h + 0.10 + arrow_band + frame_h + bottom
-    question_y = figure_h - 0.08
-    option_y = question_y - question_h
+    figure_h = 0.04 + question_h + choice_h + answer_h + 0.06 + arrow_band + frame_h + bottom
+    question_y = figure_h - 0.02
+    choice_y = question_y - question_h
+    answer_y = choice_y - choice_h
+    text = r"font=\sffamily\scriptsize,align=left,inner sep=0pt"
     lines = [
         r"\documentclass[tikz,border=1pt]{standalone}",
         r"\usepackage[T1]{fontenc}",
@@ -90,15 +93,13 @@ def _tikz(bundle: dict, panels: list[Path]) -> str:
         rf"\definecolor{{vanillabad}}{{HTML}}{{{CRIMSON}}}",
         r"\begin{document}",
         r"\begin{tikzpicture}[x=1cm,y=1cm,>=Stealth]",
-        rf"\node[anchor=north west,text width={CONTENT_WIDTH_CM:.2f}cm,font=\sffamily\footnotesize,align=left] "
-        rf"at ({LEFT_CM:.2f},{question_y:.3f}) {{\textbf{{{_escape(bundle['question_id'])}}}\\{_escape(question)}}};",
+        rf"\node[anchor=north west,text width={CONTENT_WIDTH_CM:.2f}cm,{text}] "
+        rf"at ({LEFT_CM:.2f},{question_y:.3f}) {{\textbf{{{_escape(bundle['question_id'])}}} {_escape(question)}}};",
+        rf"\node[anchor=north west,text width={CONTENT_WIDTH_CM:.2f}cm,{text}] "
+        rf"at ({LEFT_CM:.2f},{choice_y:.3f}) {{{choice_body}}};",
+        rf"\node[anchor=north west,text width={CONTENT_WIDTH_CM:.2f}cm,{text}] "
+        rf"at ({LEFT_CM:.2f},{answer_y:.3f}) {{{answer_body}}};",
     ]
-    for (text, _count), height in zip(choices, option_heights):
-        lines.append(
-            rf"\node[anchor=north west,text width={CONTENT_WIDTH_CM:.2f}cm,font=\sffamily\footnotesize,align=left] "
-            rf"at ({LEFT_CM:.2f},{option_y:.3f}) {{{text}}};"
-        )
-        option_y -= height
     rects = []
     row_width = len(panels) * frame_w + max(len(panels) - 1, 0) * gap
     x_origin = LEFT_CM + max(0.0, (CONTENT_WIDTH_CM - row_width) / 2)
@@ -110,9 +111,10 @@ def _tikz(bundle: dict, panels: list[Path]) -> str:
             rf"\node[anchor=south west,inner sep=0] at ({x0:.3f},{frame_bottom:.3f}) "
             rf"{{\includegraphics[width={frame_w:.3f}cm]{{{panel.resolve()}}}}};"
         )
+        _token_boxes(lines, bundle, frame_index, x0, frame_bottom, frame_w, frame_h)
         lines.append(
-            rf"\node[anchor=south west,fill=white,inner sep=1pt,font=\sffamily\scriptsize] "
-            rf"at ({x0 + 0.04:.3f},{frame_bottom + 0.04:.3f}) {{${_stamp(stamp)}\,\mathrm{{s}}$}};"
+            rf"\node[anchor=south west,fill=white,inner sep=0.4pt,font=\sffamily\tiny] "
+            rf"at ({x0 + 0.02:.3f},{frame_bottom + 0.02:.3f}) {{${_stamp(stamp)}\,\mathrm{{s}}$}};"
         )
     _arrows(lines, edges, rects, frame_top)
     lines.append(r"\end{tikzpicture}")
@@ -120,27 +122,30 @@ def _tikz(bundle: dict, panels: list[Path]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _choice_lines(bundle: dict) -> list[tuple[str, int]]:
-    vanilla = _letter(bundle.get("vanilla"))
-    learned = _letter(bundle.get("frameweave"))
-    rows = []
-    for index, raw in enumerate(bundle.get("choices") or []):
+def _choice_line(bundle: dict) -> tuple[str, int]:
+    shown = []
+    for index, raw in enumerate(list(bundle.get("choices") or [])[:4]):
         letter = chr(ord("A") + index)
-        shown = _plain(raw)
+        text = _plain(raw)
         prefix = f"{letter}. "
-        if not (shown.upper().startswith(prefix.upper()) or shown.upper().startswith(f"{letter} ")):
-            shown = prefix + shown
-        marks = []
-        if letter == vanilla:
-            marks.append(r"\textcolor{vanillabad}{Vanilla}")
-        if letter == learned:
-            marks.append(r"\textcolor{goldok}{FrameWeave}")
-        body = _escape(shown)
-        if marks:
-            body = " ".join(marks) + r"\quad " + body
-        width = 90 if marks else 98
-        rows.append((body, _estimate_lines(shown, width)))
-    return rows
+        if not (text.upper().startswith(prefix.upper()) or text.upper().startswith(f"{letter} ")):
+            text = prefix + text
+        shown.append(text)
+    if not shown:
+        return "", 1
+    body = r" \quad ".join(_escape(item) for item in shown)
+    return body, _estimate_lines("    ".join(shown), 150)
+
+
+def _answer_line(bundle: dict) -> str:
+    learned = _letter(bundle.get("frameweave")) or "?"
+    vanilla = _letter(bundle.get("vanilla")) or "?"
+    gold = str(bundle.get("gold") or "").strip().upper()[:1]
+    true = " (true)" if gold and learned == gold else ""
+    return (
+        rf"\textcolor{{goldok}}{{FrameWeave: {_escape(learned)}{_escape(true)}}}"
+        rf" \quad \textcolor{{vanillabad}}{{Vanilla: {_escape(vanilla)}}}"
+    )
 
 
 def _letter(block) -> str:
@@ -150,33 +155,61 @@ def _letter(block) -> str:
 
 
 def _frame_geometry(n_frames: int, aspect: float) -> tuple[float, float, float]:
-    gap = 0.18
-    frame_w = (CONTENT_WIDTH_CM - gap * (n_frames - 1)) / max(n_frames, 1)
+    gap = 0.06 if n_frames >= 6 else 0.12
+    frame_w = (CONTENT_WIDTH_CM - gap * max(n_frames - 1, 0)) / max(n_frames, 1)
     frame_h = frame_w / max(aspect, 0.2)
-    if frame_h > 3.2:
-        frame_h = 3.2
-        frame_w = frame_h * aspect
-        if n_frames > 1:
-            gap = (CONTENT_WIDTH_CM - n_frames * frame_w) / (n_frames - 1)
-            gap = max(gap, 0.12)
     return frame_w, frame_h, gap
+
+
+def _token_boxes(lines, bundle, frame_index, x0, y0, frame_w, frame_h) -> None:
+    boxes = bundle.get("boxes") or []
+    token_sets = bundle.get("token_sets") or []
+    sizes = bundle.get("image_sizes") or []
+    if frame_index >= len(boxes) or frame_index >= len(token_sets):
+        return
+    frame_boxes = boxes[frame_index]
+    if not frame_boxes:
+        return
+    if frame_index < len(sizes) and len(sizes[frame_index]) == 2:
+        image_w, image_h = float(sizes[frame_index][0]), float(sizes[frame_index][1])
+    else:
+        image_w = max(float(box[2]) for box in frame_boxes)
+        image_h = max(float(box[3]) for box in frame_boxes)
+    if image_w <= 0 or image_h <= 0:
+        return
+    for index in token_sets[frame_index]:
+        if not isinstance(index, int) or index < 0 or index >= len(frame_boxes):
+            continue
+        fx0, fy0, fx1, fy1 = _map_box(frame_boxes[index], image_w, image_h, x0, y0, frame_w, frame_h)
+        lines.append(
+            rf"\draw[cvprblue,line width=0.8pt] ({fx0:.3f},{fy0:.3f}) rectangle ({fx1:.3f},{fy1:.3f});"
+        )
+
+
+def _map_box(box, image_w, image_h, x0, y0, frame_w, frame_h):
+    px0, py0, px1, py1 = [float(value) for value in box]
+    fx0 = x0 + (px0 / image_w) * frame_w
+    fx1 = x0 + (px1 / image_w) * frame_w
+    fy0 = y0 + (1.0 - py1 / image_h) * frame_h
+    fy1 = y0 + (1.0 - py0 / image_h) * frame_h
+    return fx0, fy0, fx1, fy1
 
 
 def _arrows(lines: list[str], edges: list[dict], rects: list[tuple], frame_top: float) -> None:
     lookup = {item[4]: item for item in rects}
-    for ordinal, edge in enumerate(edges[:2]):
+    for ordinal, edge in enumerate(edges):
         source = lookup.get(int(edge["source"]))
         receiver = lookup.get(int(edge["receiver"]))
         if source is None or receiver is None or int(edge["source"]) == int(edge["receiver"]):
             continue
-        color = "amber" if ordinal == 0 else "ambersoft"
+        color = "amber" if ordinal % 2 == 0 else "ambersoft"
         x_start, y_start = _anchor(source, toward=receiver[0], ordinal=ordinal, incoming=False)
         x_end, y_end = _anchor(receiver, toward=source[0], ordinal=ordinal, incoming=True)
         span = abs(x_end - x_start)
-        control_y = frame_top + max(0.72, 0.30 + 0.07 * span) + 0.28 * ordinal
+        control_y = frame_top + 0.18 + 0.16 * (ordinal % 3) + min(0.16, 0.012 * span)
         mid_x = (x_start + x_end) / 2
         lines.append(
-            rf"\draw[{color},line width=1.15pt,->] ({x_start:.3f},{y_start:.3f}) "
+            rf"\draw[{color},line width=0.9pt,->] ({x_start:.3f},{y_start:.3f}) "
             rf".. controls ({mid_x:.3f},{control_y:.3f}) .. ({x_end:.3f},{y_end:.3f});"
         )
 
@@ -184,7 +217,7 @@ def _arrows(lines: list[str], edges: list[dict], rects: list[tuple], frame_top: 
 def _anchor(rect, toward: float, ordinal: int = 0, incoming: bool = False) -> tuple[float, float]:
     x0, bottom, width, height, _frame = rect
     y = bottom + height
-    inset = min(max(width * 0.28, 0.45), 1.35)
+    inset = min(max(width * 0.22, 0.18), 0.55)
     if toward >= x0 + width / 2:
         x = x0 + width - inset
         if incoming:
@@ -287,14 +320,25 @@ def render_layout_smoke(out_dir: Path) -> None:
         raise RuntimeError("layout smoke must not write into the paper tree")
     width, height = 640, 360
     frames = []
-    for index in range(3):
+    for index in range(8):
         image = Image.new("RGB", (width, height), (226, 226, 226))
         draw = ImageDraw.Draw(image)
-        draw.rectangle([20 + 40 * index, 20, 120 + 40 * index, 120], fill=(80, 80, 80))
+        draw.rectangle([20 + 30 * index, 20, 90 + 30 * index, 90], fill=(80, 80, 80))
         draw.text((12, 12), "SYNTHETIC", fill=(20, 20, 20))
         frames.append(image)
+    cell_w, cell_h = width / 6, height / 4
+    boxes = []
+    for _frame in range(8):
+        frame_boxes = []
+        for row in range(4):
+            for col in range(6):
+                frame_boxes.append(
+                    [col * cell_w, row * cell_h, (col + 1) * cell_w, (row + 1) * cell_h]
+                )
+        boxes.append(frame_boxes)
     bundle = {
         "example": True,
+        "layout": "token_row8",
         "question_id": "TSO_LAYOUT_SMOKE",
         "question": (
             "SYNTHETIC LAYOUT CHECK for a 100% compact example. "
@@ -303,17 +347,22 @@ def render_layout_smoke(out_dir: Path) -> None:
         "choices": [
             "A. 1->2->3->4",
             "B. 4->3->2->1",
-            "C. synthetic wrong order",
-            "D. synthetic gold order",
+            "C. 4->3->1->2",
+            "D. 2->1->4->3",
             "E. At least two descriptions do not match the video.",
         ],
-        "timestamps": [12.0, 37.5, 90.0],
-        "selection": {"keyframes": [0, 1, 2]},
+        "gold": "D",
+        "timestamps": [12.0, 23.3, 37.5, 48.0, 62.0, 80.0, 90.0, 105.7],
+        "selection": {"keyframes": list(range(8))},
         "displayed_edges": [
-            {"receiver": 2, "source": 0},
-            {"receiver": 2, "source": 1},
+            {"receiver": 7, "source": 0},
+            {"receiver": 7, "source": 3},
+            {"receiver": 4, "source": 1},
         ],
-        "vanilla": {"letter": "C", "text": "synthetic wrong order"},
+        "boxes": boxes,
+        "token_sets": [[0, 7], [1, 8], [2], [3, 9], [4], [5, 10], [6], [0, 11]],
+        "image_sizes": [[width, height] for _frame in range(8)],
+        "vanilla": {"letter": "E", "text": "abstention"},
         "frameweave": {"letter": "D", "text": "synthetic gold order"},
         "render_allowed": True,
     }
@@ -324,14 +373,18 @@ def render_layout_smoke(out_dir: Path) -> None:
         out_dir / "LAYOUT_SMOKE.pdf",
     )
     tex = tex_path.read_text(encoding="utf-8")
-    for required in ("TSO_LAYOUT_SMOKE", "Vanilla", "FrameWeave", "1->2->3->4", "At least two descriptions"):
+    for required in ("TSO_LAYOUT_SMOKE", "Vanilla: E", "FrameWeave: D (true)", "1->2->3->4", "cvprblue"):
         if required not in tex:
             raise AssertionError(f"compact layout is missing {required}")
+    if "At least two descriptions" in tex:
+        raise AssertionError("the fifth choice should stay off the paper row")
     for forbidden in (r"\beta", r"\Delta", "candidate", "Visual reading", "Top-", "margin", "t_1"):
         if forbidden in tex:
             raise AssertionError(f"compact layout still contains {forbidden}")
-    if tex.count("->") < 2:
-        raise AssertionError("compact layout did not draw both arrows")
+    if tex.count(r"\includegraphics") != 8:
+        raise AssertionError("the paper row must show all 8 frames")
+    if tex.count("rectangle") < 8:
+        raise AssertionError("token boxes were not drawn")
 
 
 def _preview(pdf_path: Path, png_path: Path) -> None:

@@ -169,7 +169,8 @@ def extract_question(case: dict, args, runtime: dict | None = None) -> dict:
             )
             _assert_beta(full_payload["beta"], full_payload["valid"])
             return _live_result(
-                case, args, frames, indices, frame_meta, localization, vanilla, full_payload
+                case, args, frames, indices, frame_meta, localization, vanilla, full_payload,
+                model, prepared,
             )
         if example:
             full_payload = _forward(
@@ -177,7 +178,9 @@ def extract_question(case: dict, args, runtime: dict | None = None) -> dict:
                 check_beta=True,
             )
             _assert_beta(full_payload["beta"], full_payload["valid"])
-            return _example_result(case, args, frames, indices, frame_meta, localization, full_payload)
+            return _example_result(
+                case, args, frames, indices, frame_meta, localization, full_payload, model, prepared
+            )
         input_ids, _pixels, grid_thws = prepared
         spans = visual_atom_spans(input_ids)
         tokens_per_frame = [end - start for start, end in spans]
@@ -514,7 +517,7 @@ def _assert_beta(beta: np.ndarray, valid: np.ndarray) -> None:
             raise AssertionError("beta diagonal is not closed")
 
 
-def _live_result(case, args, frames, indices, frame_meta, localization, vanilla_scores, payload) -> dict:
+def _live_result(case, args, frames, indices, frame_meta, localization, vanilla_scores, payload, model, prepared) -> dict:
     """Score Vanilla and Hybrid live. Draw only a Vanilla-wrong, Hybrid-correct question."""
     from reljoin.evidence_flow.mine import _choice_text, live_qualifies
     from reljoin.herbench_oracle import sha256_file
@@ -547,6 +550,7 @@ def _live_result(case, args, frames, indices, frame_meta, localization, vanilla_
         },
         "csv_vanilla_letter": case.get("vanilla_letter") or "",
         "csv_hybrid_letter": case.get("hybrid_letter") or "",
+        "layout": "token_row8",
         "render_allowed": False,
         "reject_reason": "",
     }
@@ -557,8 +561,7 @@ def _live_result(case, args, frames, indices, frame_meta, localization, vanilla_
         )
         return {"bundle": bundle, "frames": frames, "render": False}
     beta = payload["beta"][0]
-    selection = select_keyframes(beta)
-    keyframes, edges = _example_view(selection, beta)
+    keyframes, edges = _row_exchange(beta)
     bundle.update({
         "localization": localization,
         "frame_indices": indices,
@@ -567,21 +570,22 @@ def _live_result(case, args, frames, indices, frame_meta, localization, vanilla_
         "displayed_edges": edges,
         "render_allowed": bool(keyframes),
     })
+    _attach_tokens(bundle, model, frames, prepared, payload)
     if not keyframes:
         bundle["reject_reason"] = "The live answers qualify, but no frames were selected."
         return {"bundle": bundle, "frames": frames, "render": False}
     return {"bundle": bundle, "frames": frames, "render": True}
 
 
-def _example_result(case, args, frames, indices, frame_meta, localization, payload) -> dict:
-    """One Hybrid forward: CSV letters, at most four frames, and two arrows."""
+def _example_result(case, args, frames, indices, frame_meta, localization, payload, model, prepared) -> dict:
+    """One Hybrid forward: CSV letters, all eight frames, and their token exchange."""
     from reljoin.herbench_oracle import sha256_file
 
     beta = payload["beta"][0]
-    selection = select_keyframes(beta)
-    keyframes, edges = _example_view(selection, beta)
+    keyframes, edges = _row_exchange(beta)
     bundle = {
         "example": True,
+        "layout": "token_row8",
         "question_id": case["question_id"],
         "task_type": case.get("task_type") or "",
         "question": case.get("question") or "",
@@ -605,7 +609,58 @@ def _example_result(case, args, frames, indices, frame_meta, localization, paylo
         "render_allowed": True,
         "reject_reason": "" if edges else "No off-diagonal relation was strong enough to draw an arrow.",
     }
+    _attach_tokens(bundle, model, frames, prepared, payload)
     return {"bundle": bundle, "frames": frames, "render": True}
+
+
+def _row_exchange(beta: np.ndarray, *, min_beta: float = 0.20, max_edges: int = 6):
+    """All frames, plus the strongest cross-frame reads."""
+    matrix = np.asarray(beta, dtype=np.float64)
+    count = int(matrix.shape[0])
+    edges = []
+    for receiver in range(count):
+        ranked = sorted(
+            (
+                (source, float(matrix[receiver, source]))
+                for source in range(count)
+                if source != receiver
+            ),
+            key=lambda item: (-item[1], item[0]),
+        )
+        if ranked and ranked[0][1] >= min_beta:
+            edges.append({"receiver": receiver, "source": int(ranked[0][0]), "beta": ranked[0][1]})
+    edges.sort(key=lambda edge: (-edge["beta"], edge["receiver"], edge["source"]))
+    if not edges:
+        best = None
+        for receiver in range(count):
+            for source in range(count):
+                if receiver == source:
+                    continue
+                weight = float(matrix[receiver, source])
+                if best is None or weight > best["beta"]:
+                    best = {"receiver": receiver, "source": source, "beta": weight}
+        if best is not None and best["beta"] > 0:
+            edges = [best]
+    return list(range(count)), edges[:max_edges]
+
+
+def _attach_tokens(bundle, model, frames, prepared, payload) -> None:
+    """Top-alpha token boxes from the same Hybrid forward. No extra ablation."""
+    from reljoin.ovis_hooks import visual_atom_spans
+
+    input_ids, _pixels, grid_thws = prepared
+    spans = visual_atom_spans(input_ids)
+    tokens_per_frame = [end - start for start, end in spans]
+    boxes = _boxes_for_frames(model, frames, grid_thws, tokens_per_frame)
+    alpha = payload["alpha"]
+    valid = payload["valid"]
+    token_sets = [
+        top_alpha_tokens(alpha[0, frame], valid[0, frame], 4)
+        for frame in range(len(frames))
+    ]
+    bundle["boxes"] = [item.tolist() for item in boxes]
+    bundle["token_sets"] = token_sets
+    bundle["image_sizes"] = [[int(frame.size[0]), int(frame.size[1])] for frame in frames]
 
 
 def _example_view(selection: dict, beta: np.ndarray, *, max_frames: int = 4, max_edges: int = 2):
